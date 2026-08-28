@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+!.env.example
+server.log
+dist/
+build/
+.vite/
+npm-debug.log*
