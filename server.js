@@ -1,9 +1,16 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
+import session from "express-session";
 import { AzureOpenAI } from "openai";
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:5005,http://localhost:5173")
@@ -15,14 +22,410 @@ app.use(cors({
   origin: allowedOrigins,
   credentials: true
 }));
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
+app.use(session({
+  secret: process.env.SESSION_SECRET || "btv-planner-session-secret",
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: false
+  }
+}));
 
-const PORT = process.env.PORT || 5000;
+const PORT = Number(process.env.PORT || 5000);
+const STORAGE_ROOT = path.resolve(process.env.BTV_STORAGE_ROOT || path.join(__dirname, "..", "BTV_PLANNER"));
 
 const client = new AzureOpenAI({
   apiKey:     process.env.MB_GENAI_API_KEY,
   apiVersion: process.env.MB_GENAI_API_VERSION,
   endpoint:   process.env.MB_GENAI_ENDPOINT
+});
+
+function normalizeUserName(value) {
+  const rawValue = String(value || "").trim();
+  const shortId = rawValue.split(/[\\/@]/).pop();
+
+  return shortId
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, "")
+    .replace(/\.+/g, ".")
+    .replace(/^-+|-+$/g, "");
+}
+
+function getWindowsUserCandidates() {
+  return [
+    process.env.USERNAME,
+    process.env.USER,
+    process.env.LOGONUSER,
+    process.env.AD_USER,
+    process.env.BTV_USER,
+    process.env.DEFAULT_USER
+  ].filter(Boolean);
+}
+
+function resolveCurrentUser(req) {
+  const sessionUser = normalizeUserName(req.session?.user);
+  if (sessionUser) return sessionUser;
+
+  const headerUser = normalizeUserName(
+    req.headers["x-user"] ||
+    req.headers["x-forwarded-user"] ||
+    req.headers["x-auth-user"]
+  );
+  if (headerUser) return headerUser;
+
+  const candidates = getWindowsUserCandidates();
+  const candidate = candidates.map(normalizeUserName).find(Boolean);
+  if (candidate) return candidate;
+
+  const fallback = normalizeUserName(process.env.DEFAULT_USER || "hemanth");
+  return fallback;
+}
+
+async function ensureStorageStructure() {
+  const directories = [
+    STORAGE_ROOT,
+    path.join(STORAGE_ROOT, "users"),
+    path.join(STORAGE_ROOT, "shared_templates")
+  ];
+
+  for (const dir of directories) {
+    await fs.mkdir(dir, { recursive: true });
+  }
+
+  const userNames = ["hemanth", "nethravathi", "shreya", "hari"];
+  for (const user of userNames) {
+    await fs.mkdir(path.join(STORAGE_ROOT, "users", user), { recursive: true });
+  }
+}
+
+function sanitizeFileName(value) {
+  return String(value || "untitled")
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "") || "untitled";
+}
+
+function createPlanFileId(carline, commodity) {
+  const cleanCarline = sanitizeFileName(carline || "plan");
+  const cleanCommodity = String(commodity || "commodity")
+    .trim()
+    .replace(/[^a-zA-Z0-9]+/g, "") || "commodity";
+  return `${cleanCarline}_${cleanCommodity}`;
+}
+
+function ensureMetadata(plan, user) {
+  const now = new Date().toISOString();
+  const owner = normalizeUserName(plan?.owner || user || "");
+  const createdBy = normalizeUserName(plan?.createdBy || user || owner || "");
+  const lastModifiedBy = normalizeUserName(user || plan?.lastModifiedBy || createdBy || owner || "");
+  const createdDate = plan?.createdDate || now;
+  const lastModifiedDate = plan?.lastModifiedDate || now;
+  const planId = plan?.planId || plan?.id || createPlanFileId(plan?.carline, plan?.commodity);
+
+  return {
+    ...plan,
+    owner,
+    createdBy,
+    lastModifiedBy,
+    createdDate,
+    lastModifiedDate,
+    planId,
+    id: plan?.id || planId
+  };
+}
+
+async function listJsonFiles(rootDir) {
+  try {
+    const entries = await fs.readdir(rootDir, { withFileTypes: true });
+    const nested = [];
+
+    for (const entry of entries) {
+      const fullPath = path.join(rootDir, entry.name);
+      if (entry.isDirectory()) {
+        nested.push(...await listJsonFiles(fullPath));
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".json")) {
+        nested.push(fullPath);
+      }
+    }
+
+    return nested;
+  } catch {
+    return [];
+  }
+}
+
+async function readPlanFileData(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    if (!raw.trim()) return null;
+    const plan = JSON.parse(raw);
+    return plan && typeof plan === "object" ? plan : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getAllPlansForUser(owner) {
+  const userDir = path.join(STORAGE_ROOT, "users", owner || "");
+  const files = await listJsonFiles(userDir);
+  const plans = [];
+
+  for (const filePath of files) {
+    const plan = await readPlanFileData(filePath);
+    if (plan) plans.push(plan);
+  }
+
+  return plans
+    .map((plan) => ensureMetadata(plan, owner))
+    .sort((a, b) => (b.lastModifiedDate || "").localeCompare(a.lastModifiedDate || ""));
+}
+
+async function getAllPlansAcrossUsers() {
+  const usersRoot = path.join(STORAGE_ROOT, "users");
+  const entries = await fs.readdir(usersRoot, { withFileTypes: true });
+  const plans = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const owner = entry.name;
+    const userPlans = await getAllPlansForUser(owner);
+    plans.push(...userPlans);
+  }
+
+  return plans.sort((a, b) => (b.lastModifiedDate || "").localeCompare(a.lastModifiedDate || ""));
+}
+
+async function getAllTemplatePlans() {
+  const dir = path.join(STORAGE_ROOT, "shared_templates");
+  const files = await listJsonFiles(dir);
+  const plans = [];
+
+  for (const file of files) {
+    const plan = await readPlanFileData(file);
+    if (plan) plans.push(ensureMetadata(plan, plan.owner || "shared_templates"));
+  }
+
+  return plans.sort((a, b) => (b.lastModifiedDate || "").localeCompare(a.lastModifiedDate || ""));
+}
+
+function buildPlanPath(owner, plan) {
+  const safeOwner = normalizeUserName(owner || "");
+  const safePlanId = sanitizeFileName(plan?.planId || plan?.id || `${plan?.carline || "plan"}_${Date.now()}`);
+  return path.join(STORAGE_ROOT, "users", safeOwner || "unknown", `${safePlanId}.json`);
+}
+
+async function findPlanByIdOrFileId(targetId) {
+  const planId = String(targetId || "");
+  const allPlans = await getAllPlansAcrossUsers();
+  const match = allPlans.find((plan) => {
+    const ids = [plan.planId, plan.id, path.basename(plan._filePath || "")];
+    return ids.some((entry) => String(entry || "") === planId);
+  });
+
+  if (match) {
+    const owner = normalizeUserName(match.owner);
+    const filePath = path.join(STORAGE_ROOT, "users", owner, `${sanitizeFileName(match.planId || match.id)}.json`);
+    return { ...match, _filePath: filePath };
+  }
+
+  return null;
+}
+
+async function writePlan(plan, currentUser) {
+  const normalizedPlan = ensureMetadata(plan, currentUser);
+  const owner = normalizeUserName(normalizedPlan.owner || currentUser || "");
+  const filePath = buildPlanPath(owner, normalizedPlan);
+
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+
+  normalizedPlan.owner = owner;
+  normalizedPlan.createdBy = normalizeUserName(normalizedPlan.createdBy || owner || currentUser || "");
+  normalizedPlan.lastModifiedBy = normalizeUserName(currentUser || normalizedPlan.lastModifiedBy || normalizedPlan.createdBy || owner || "");
+  normalizedPlan.lastModifiedDate = new Date().toISOString();
+  normalizedPlan.id = normalizedPlan.planId || normalizedPlan.id;
+
+  await fs.writeFile(filePath, JSON.stringify(normalizedPlan, null, 2), "utf8");
+  return { ...normalizedPlan, _filePath: filePath };
+}
+
+app.use(async (req, res, next) => {
+  try {
+    await ensureStorageStructure();
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/session", (req, res) => {
+  const currentUser = resolveCurrentUser(req);
+  req.session.user = currentUser;
+  res.json({ ok: true, user: currentUser, availableUsers: ["hemanth", "nethravathi", "shreya", "hari"] });
+});
+
+app.get("/api/plans/my", async (req, res) => {
+  const currentUser = resolveCurrentUser(req);
+  req.session.user = currentUser;
+  const plans = await getAllPlansForUser(currentUser);
+  res.json({ ok: true, plans });
+});
+
+app.get("/api/plans/team", async (req, res) => {
+  const plans = await getAllPlansAcrossUsers();
+  res.json({ ok: true, plans });
+});
+
+app.get("/api/plans/templates", async (req, res) => {
+  const plans = await getAllTemplatePlans();
+  res.json({ ok: true, plans });
+});
+
+app.get("/api/plans/:id", async (req, res) => {
+  const plan = await findPlanByIdOrFileId(req.params.id);
+  if (!plan) {
+    return res.status(404).json({ ok: false, error: "Plan not found" });
+  }
+
+  return res.json({ ok: true, plan });
+});
+
+app.post("/api/plans/save", async (req, res) => {
+  try {
+    const currentUser = resolveCurrentUser(req);
+    req.session.user = currentUser;
+    const incomingPlan = req.body || {};
+    const plan = ensureMetadata(incomingPlan, currentUser);
+
+    if (!plan.carline || !plan.commodity) {
+      return res.status(400).json({ ok: false, error: "Carline and commodity are required." });
+    }
+
+    const owner = normalizeUserName(plan.owner || currentUser);
+    if (plan.owner && owner !== normalizeUserName(currentUser)) {
+      return res.status(403).json({
+        ok: false,
+        error: `This is a read-only plan owned by ${owner}. Use Save As My Copy to create your own editable version.`
+      });
+    }
+
+    const savedPlan = await writePlan({
+      ...plan,
+      owner,
+      createdBy: normalizeUserName(plan.createdBy || currentUser),
+      lastModifiedBy: normalizeUserName(currentUser),
+      lastModifiedDate: new Date().toISOString()
+    }, currentUser);
+
+    return res.json({ ok: true, plan: savedPlan });
+  } catch (error) {
+    console.error("Save plan error:", error);
+    return res.status(500).json({ ok: false, error: error.message || "Failed to save plan." });
+  }
+});
+
+app.post("/api/plans/copy", async (req, res) => {
+  try {
+    const currentUser = resolveCurrentUser(req);
+    req.session.user = currentUser;
+    const { planId, owner } = req.body || {};
+    if (!planId) {
+      return res.status(400).json({ ok: false, error: "Plan id is required." });
+    }
+
+    const sourcePlans = await getAllPlansAcrossUsers();
+    const sourcePlan = sourcePlans.find((plan) => String(plan.planId || plan.id) === String(planId));
+
+    if (!sourcePlan) {
+      return res.status(404).json({ ok: false, error: "Plan not found." });
+    }
+
+    const sourceOwner = normalizeUserName(sourcePlan.owner || owner || currentUser);
+    const copyId = `${sanitizeFileName(sourcePlan.carline || "copy")}_${sanitizeFileName(sourcePlan.commodity || "plan")}_${Date.now()}`;
+    const copiedPlan = ensureMetadata({
+      ...sourcePlan,
+      owner: currentUser,
+      createdBy: currentUser,
+      lastModifiedBy: currentUser,
+      createdDate: new Date().toISOString(),
+      lastModifiedDate: new Date().toISOString(),
+      planId: copyId,
+      id: copyId,
+      copiedFrom: sourceOwner,
+      copiedFromPlanId: String(sourcePlan.planId || sourcePlan.id || planId)
+    }, currentUser);
+
+    const saved = await writePlan(copiedPlan, currentUser);
+    return res.json({ ok: true, plan: saved });
+  } catch (error) {
+    console.error("Copy plan error:", error);
+    return res.status(500).json({ ok: false, error: error.message || "Failed to copy plan." });
+  }
+});
+
+app.post("/api/plans/migrate", async (req, res) => {
+  try {
+    const currentUser = resolveCurrentUser(req);
+    req.session.user = currentUser;
+    const incomingPlans = Array.isArray(req.body?.plans) ? req.body.plans : [];
+
+    if (!incomingPlans.length) {
+      return res.json({ ok: true, migrated: 0, plans: [] });
+    }
+
+    const migrated = [];
+    for (const incomingPlan of incomingPlans) {
+      const plan = ensureMetadata(incomingPlan, currentUser);
+      const owner = normalizeUserName(plan.owner || currentUser || "");
+      const ownedPlan = {
+        ...plan,
+        owner,
+        createdBy: normalizeUserName(plan.createdBy || currentUser || owner),
+        lastModifiedBy: normalizeUserName(currentUser),
+        createdDate: plan.createdDate || new Date().toISOString(),
+        lastModifiedDate: new Date().toISOString(),
+        planId: plan.planId || plan.id || `${sanitizeFileName(plan.carline || "plan")}_${Date.now()}`
+      };
+
+      const existing = await findPlanByIdOrFileId(ownedPlan.planId);
+      if (existing && normalizeUserName(existing.owner || owner) === owner) {
+        continue;
+      }
+
+      const saved = await writePlan(ownedPlan, currentUser);
+      migrated.push(saved);
+    }
+
+    return res.json({ ok: true, migrated: migrated.length, plans: migrated });
+  } catch (error) {
+    console.error("Migrate plans error:", error);
+    return res.status(500).json({ ok: false, error: error.message || "Failed to migrate plans." });
+  }
+});
+
+app.delete("/api/plans/:id", async (req, res) => {
+  try {
+    const currentUser = resolveCurrentUser(req);
+    req.session.user = currentUser;
+    const plan = await findPlanByIdOrFileId(req.params.id);
+    if (!plan) {
+      return res.status(404).json({ ok: false, error: "Plan not found" });
+    }
+
+    if (normalizeUserName(plan.owner || "") !== normalizeUserName(currentUser)) {
+      return res.status(403).json({ ok: false, error: "You can only delete your own plans." });
+    }
+
+    const filePath = plan._filePath || buildPlanPath(plan.owner, plan);
+    await fs.unlink(filePath).catch(() => {});
+    return res.json({ ok: true, deleted: true, id: req.params.id });
+  } catch (error) {
+    console.error("Delete plan error:", error);
+    return res.status(500).json({ ok: false, error: error.message || "Delete failed." });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -196,9 +599,6 @@ const MILESTONE_SYSTEM_PROMPT = [
   "- Keep overallCommentary under 200 characters."
 ].join("\n");
 
-// ─────────────────────────────────────────────────────────────
-// Utility — safely parse the model output as JSON
-// ─────────────────────────────────────────────────────────────
 function safeParseAIResponse(raw) {
   if (!raw || typeof raw !== "string") return null;
 
@@ -215,7 +615,7 @@ function safeParseAIResponse(raw) {
   }
 
   const first = text.indexOf("{");
-  const last  = text.lastIndexOf("}");
+  const last = text.lastIndexOf("}");
   if (first !== -1 && last !== -1 && last > first) {
     const candidate = text.slice(first, last + 1);
     try {
@@ -239,18 +639,13 @@ function safeParseAIMilestones(raw) {
     parsed = JSON.parse(text);
   } catch {
     const first = text.indexOf("{");
-    const last  = text.lastIndexOf("}");
+    const last = text.lastIndexOf("}");
     if (first !== -1 && last !== -1 && last > first) {
       try { parsed = JSON.parse(text.slice(first, last + 1)); } catch { return null; }
     }
   }
   if (!parsed || typeof parsed !== "object") return null;
   if (!parsed.aiMilestones || typeof parsed.aiMilestones !== "object") return null;
-  const expectedKeys = [
-    "supplierNomination","pDesignFreeze","pRelease","protoToolStart","protoParts",
-    "wDesignFreeze","wRelease","seriesToolStart","eswft","blankDesignFreeze","blankRelease","swft","ppap"
-  ];
-  // Allow missing design freeze keys from AI — we will compute them below if absent
   const requiredKeys = [
     "supplierNomination","pRelease","protoToolStart","protoParts",
     "wRelease","seriesToolStart","eswft","blankRelease","swft","ppap"
@@ -262,27 +657,6 @@ function safeParseAIMilestones(raw) {
 
   const ms = parsed.aiMilestones;
 
-  // Guardrail 1: W-Release must be at least 8 weeks after Proto Parts
-  const protoPartsDate = ms.protoParts?.plannedDate;
-  const wReleaseDate   = ms.wRelease?.plannedDate;
-  if (protoPartsDate && wReleaseDate) {
-    const protoPartsMs = new Date(protoPartsDate).getTime();
-    const wReleaseMs   = new Date(wReleaseDate).getTime();
-    const gapWeeks     = (wReleaseMs - protoPartsMs) / (1000 * 60 * 60 * 24 * 7);
-    if (gapWeeks < 8) {
-      const corrected = new Date(protoPartsMs + 8 * 7 * 24 * 60 * 60 * 1000);
-      ms.wRelease.plannedDate = corrected.toISOString().slice(0, 10);
-      const seriesToolDate = ms.seriesToolStart?.plannedDate;
-      if (seriesToolDate) {
-        const minStMs = corrected.getTime() + 2 * 7 * 24 * 60 * 60 * 1000;
-        if (new Date(seriesToolDate).getTime() < minStMs) {
-          ms.seriesToolStart.plannedDate = new Date(minStMs).toISOString().slice(0, 10);
-        }
-      }
-    }
-  }
-
-  // Guardrail 2: Design Freeze milestones = Release date − 2 weeks (enforce regardless of AI output)
   function twoWeeksBefore(dateStr) {
     if (!dateStr) return null;
     return new Date(new Date(dateStr).getTime() - 2 * 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -303,17 +677,23 @@ function safeParseAIMilestones(raw) {
     ms.blankDesignFreeze.reason = ms.blankDesignFreeze.reason || "2 weeks before Blank Release";
   }
 
+  const protoPartsDate = ms.protoParts?.plannedDate;
+  const wReleaseDate = ms.wRelease?.plannedDate;
+  if (protoPartsDate && wReleaseDate) {
+    const gapWeeks = (new Date(wReleaseDate) - new Date(protoPartsDate)) / (1000 * 60 * 60 * 24 * 7);
+    if (gapWeeks < 8) {
+      const corrected = new Date(new Date(protoPartsDate).getTime() + 8 * 7 * 24 * 60 * 60 * 1000);
+      ms.wRelease.plannedDate = corrected.toISOString().slice(0, 10);
+      if (ms.wDesignFreeze) ms.wDesignFreeze.plannedDate = twoWeeksBefore(ms.wRelease.plannedDate);
+    }
+  }
+
   return {
     aiMilestones: ms,
-    overallCommentary: typeof parsed.overallCommentary === "string"
-      ? parsed.overallCommentary.trim()
-      : ""
+    overallCommentary: typeof parsed.overallCommentary === "string" ? parsed.overallCommentary.trim() : ""
   };
 }
 
-// ─────────────────────────────────────────────────────────────
-// Health check
-// ─────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ status: "CTP AI Backend is running" });
 });
@@ -322,9 +702,6 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// ─────────────────────────────────────────────────────────────
-// AI advisory endpoint
-// ─────────────────────────────────────────────────────────────
 app.post("/ai-advice", async (req, res) => {
   try {
     const plan = req.body;
@@ -333,13 +710,12 @@ app.post("/ai-advice", async (req, res) => {
       return res.status(400).json({ error: "Invalid plan payload" });
     }
 
-    // Determine which lanes are visible so the AI scopes its analysis accordingly
     const vl = plan._visibleLanes || {};
     const visibleLaneNames = [
-      vl.buildPlan     && "Build Plan",
-      vl.btvRule       && "BTV Milestones (Rule)",
-      vl.btvMyPlan     && "My Plan (custom milestones)",
-      vl.aiOptimized   && "AI Optimized Plan",
+      vl.buildPlan && "Build Plan",
+      vl.btvRule && "BTV Milestones (Rule)",
+      vl.btvMyPlan && "My Plan (custom milestones)",
+      vl.aiOptimized && "AI Optimized Plan",
       vl.subActivities && "Sub-Activities"
     ].filter(Boolean);
 
@@ -349,7 +725,6 @@ app.post("/ai-advice", async (req, res) => {
         `If a lane is listed as visible but its data is empty, state that it contains no data rather than flagging it as a risk.`
       : "No timeline lanes are currently visible. Advise the engineer to select at least one lane to get meaningful feedback.";
 
-    // Strip internal UI field before sending to AI
     const { _visibleLanes, ...planForAI } = plan;
 
     const completion = await client.chat.completions.create({
@@ -370,38 +745,28 @@ app.post("/ai-advice", async (req, res) => {
     });
 
     const rawContent = completion.choices?.[0]?.message?.content || "";
-    const parsed     = safeParseAIResponse(rawContent);
+    const parsed = safeParseAIResponse(rawContent);
 
     if (!parsed) {
       console.warn("Unparseable advisory output:", rawContent);
-      return res.status(200).json({
-        ok:    false,
-        error: "AI returned unstructured content. Try again."
-      });
+      return res.status(200).json({ ok: false, error: "AI returned unstructured content. Try again." });
     }
 
     const advisory = {
       overallRisk: parsed.overallRisk || "Yellow",
-      summary:     parsed.summary     || "",
-      sequencingAndToolingRisk:      Array.isArray(parsed.sequencingAndToolingRisk)      ? parsed.sequencingAndToolingRisk      : [],
-      ppapAndSamplingDeviationRisk:  Array.isArray(parsed.ppapAndSamplingDeviationRisk)  ? parsed.ppapAndSamplingDeviationRisk  : [],
-      recommendation:                Array.isArray(parsed.recommendation)                ? parsed.recommendation                : []
+      summary: parsed.summary || "",
+      sequencingAndToolingRisk: Array.isArray(parsed.sequencingAndToolingRisk) ? parsed.sequencingAndToolingRisk : [],
+      ppapAndSamplingDeviationRisk: Array.isArray(parsed.ppapAndSamplingDeviationRisk) ? parsed.ppapAndSamplingDeviationRisk : [],
+      recommendation: Array.isArray(parsed.recommendation) ? parsed.recommendation : []
     };
 
     return res.json({ ok: true, advisory });
-
   } catch (err) {
     console.error("AI advice error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "AI request failed"
-    });
+    return res.status(500).json({ ok: false, error: err.message || "AI request failed" });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// AI chat endpoint (Step 6.3.d)
-// ─────────────────────────────────────────────────────────────
 app.post("/ai-chat", async (req, res) => {
   try {
     const { messages, currentPlan, allPlans } = req.body || {};
@@ -415,52 +780,34 @@ app.post("/ai-chat", async (req, res) => {
       .map((p) => (p && p.carline ? String(p.carline) : ""))
       .filter(Boolean);
 
-    const contextMessages = [
-      { role: "system", content: CHAT_SYSTEM_PROMPT }
-    ];
+    const contextMessages = [{ role: "system", content: CHAT_SYSTEM_PROMPT }];
 
     contextMessages.push({
       role: "system",
-      content:
-        "Today's date is " + new Date().toISOString().slice(0, 10) + ". " +
-        "Use this as the authoritative current date whenever you reason about time."
+      content: "Today's date is " + new Date().toISOString().slice(0, 10) + ". Use this as the authoritative current date whenever you reason about time."
     });
 
     contextMessages.push({
       role: "system",
-      content:
-        "Here is the full list of plans currently in the tool (allPlans). " +
-        "Use it as the authoritative source of which carlines exist and their commodities. " +
-        "Do not fabricate any plan not in this list.\n\n" +
-        "Known carlines: " + JSON.stringify(knownCarlines) + "\n\n" +
-        "allPlans JSON:\n" +
-        JSON.stringify(safeAllPlans)
+      content: "Here is the full list of plans currently in the tool (allPlans). Use it as the authoritative source of which carlines exist and their commodities. Do not fabricate any plan not in this list.\n\nKnown carlines: " + JSON.stringify(knownCarlines) + "\n\nallPlans JSON:\n" + JSON.stringify(safeAllPlans)
     });
 
     if (currentPlan && typeof currentPlan === "object") {
       contextMessages.push({
         role: "system",
-        content:
-          "This is the currently selected plan the engineer is looking at (currentPlan). " +
-          "Prefer this plan when the question does not clearly reference another carline.\n\n" +
-          JSON.stringify(currentPlan)
+        content: "This is the currently selected plan the engineer is looking at (currentPlan). Prefer this plan when the question does not clearly reference another carline.\n\n" + JSON.stringify(currentPlan)
       });
     } else {
       contextMessages.push({
         role: "system",
-        content:
-          "No specific plan is currently selected. If the engineer asks about a specific " +
-          "carline, use allPlans to answer."
+        content: "No specific plan is currently selected. If the engineer asks about a specific carline, use allPlans to answer."
       });
     }
 
     for (const m of messages) {
       if (!m || typeof m !== "object") continue;
       if (m.role === "user" || m.role === "assistant") {
-        contextMessages.push({
-          role: m.role,
-          content: String(m.content || "")
-        });
+        contextMessages.push({ role: m.role, content: String(m.content || "") });
       }
     }
 
@@ -469,71 +816,53 @@ app.post("/ai-chat", async (req, res) => {
       messages: contextMessages
     });
 
-    const raw    = completion.choices?.[0]?.message?.content || "";
+    const raw = completion.choices?.[0]?.message?.content || "";
     const parsed = safeParseAIResponse(raw);
 
     if (!parsed) {
       console.warn("Unparseable chat output:", raw);
       return res.status(200).json({
-        ok:     true,
-        reply:  raw && raw.trim().length ? raw : "I could not generate a structured response. Please try again.",
+        ok: true,
+        reply: raw && raw.trim().length ? raw : "I could not generate a structured response. Please try again.",
         intent: { type: "none", targetCarline: "", targetCommodity: "" }
       });
     }
 
-    const reply  = typeof parsed.reply === "string" && parsed.reply.trim()
-      ? parsed.reply.trim()
-      : "I could not generate a response. Please try again.";
+    const reply = typeof parsed.reply === "string" && parsed.reply.trim() ? parsed.reply.trim() : "I could not generate a response. Please try again.";
 
-    let intent = {
-      type:            "none",
-      targetCarline:   "",
-      targetCommodity: ""
-    };
-
+    let intent = { type: "none", targetCarline: "", targetCommodity: "" };
     if (parsed.intent && typeof parsed.intent === "object") {
       const t = parsed.intent.type;
       if (t === "open_plan" || t === "switch_plan_no_open" || t === "save_chat_to_plan" || t === "none") {
         intent = {
-          type:            t,
-          targetCarline:   typeof parsed.intent.targetCarline   === "string" ? parsed.intent.targetCarline.trim()   : "",
+          type: t,
+          targetCarline: typeof parsed.intent.targetCarline === "string" ? parsed.intent.targetCarline.trim() : "",
           targetCommodity: typeof parsed.intent.targetCommodity === "string" ? parsed.intent.targetCommodity.trim() : ""
         };
       }
     }
 
-    // Backend-side guardrail: only accept intents whose targetCarline actually exists
     if (intent.type !== "none") {
-      const exists = knownCarlines.some(
-        (c) => c.toLowerCase() === intent.targetCarline.toLowerCase()
-      );
+      const exists = knownCarlines.some((c) => c.toLowerCase() === intent.targetCarline.toLowerCase());
       if (!exists) {
         intent = { type: "none", targetCarline: "", targetCommodity: "" };
       }
     }
 
-    return res.json({
-      ok:     true,
-      reply,
-      intent
-    });
-
+    return res.json({ ok: true, reply, intent });
   } catch (err) {
     console.error("AI chat error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "AI chat request failed"
-    });
+    return res.status(500).json({ ok: false, error: err.message || "AI chat request failed" });
   }
 });
 
-// Phase 4 Sub-step 4F.1 — AI-suggested milestones
 app.post("/ai-milestones", async (req, res) => {
   try {
     const { plan } = req.body || {};
     if (!plan || !plan.carline) {
       return res.status(400).json({ error: "Invalid plan payload" });
     }
+
     const completion = await client.chat.completions.create({
       model: process.env.MB_GENAI_MODEL,
       messages: [
@@ -547,33 +876,23 @@ app.post("/ai-milestones", async (req, res) => {
             "If aiSource is 'rule', use the rule-based milestone plan as the baseline. " +
             "If aiSource is 'myPlan', use the engineer's My Plan milestones (milestonesForAI) as the baseline. " +
             "Use milestonesForAI as the primary baseline for optimisation when present. " +
-            "Return only the JSON object in the required schema. " +
-            "No prose, no markdown.\n\n" +
-            "Plan JSON:\n" +
-            JSON.stringify(plan)
+            "Return only the JSON object in the required schema. No prose, no markdown.\n\n" +
+            "Plan JSON:\n" + JSON.stringify(plan)
         }
       ]
     });
-    const raw    = completion.choices?.[0]?.message?.content || "";
+
+    const raw = completion.choices?.[0]?.message?.content || "";
     const parsed = safeParseAIMilestones(raw);
     if (!parsed) {
       console.warn("Unparseable AI milestones output:", raw);
-      return res.status(200).json({
-        ok: false,
-        error: "AI failed to generate valid milestone plan. Try again."
-      });
+      return res.status(200).json({ ok: false, error: "AI failed to generate valid milestone plan. Try again." });
     }
-    return res.json({
-      ok: true,
-      aiMilestones: parsed.aiMilestones,
-      overallCommentary: parsed.overallCommentary
-    });
+
+    return res.json({ ok: true, aiMilestones: parsed.aiMilestones, overallCommentary: parsed.overallCommentary });
   } catch (err) {
     console.error("AI milestones error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "AI milestones request failed"
-    });
+    return res.status(500).json({ ok: false, error: err.message || "AI milestones request failed" });
   }
 });
 
