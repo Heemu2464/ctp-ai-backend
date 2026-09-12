@@ -539,6 +539,40 @@ const SYSTEM_PROMPT = [
   "    Red    = plan is not realistic or has critical sequencing / PPAP problems."
 ].join("\n");
 
+function getReadinessSummary(plan) {
+  const createdDate = plan?.createdDate ? new Date(plan.createdDate) : null;
+  const milestones = plan?.milestones || {};
+  const builds = Array.isArray(plan?.builds) ? plan.builds : [];
+  const gates = [["proto", "protoParts"], ["series", "eswft"], ["pro", "ppap"]];
+
+  const statuses = gates.map(([role, key]) => {
+    const build = builds.find((item) => item.role === role);
+    const milestone = milestones[key] || {};
+    const buildStart = build?.start || "";
+    const milestoneDate = milestone.overrideDate || milestone.plannedDate || "";
+    if (!buildStart) return "Not Relevant";
+    if (!milestoneDate) return "Tight";
+
+    const milestoneTime = new Date(milestoneDate).getTime();
+    const createdTime = createdDate?.getTime();
+    if (Number.isFinite(createdTime) && Number.isFinite(milestoneTime) && milestoneTime < createdTime) {
+      return "Completed";
+    }
+
+    const gapWeeks = (new Date(buildStart).getTime() - milestoneTime) / (1000 * 60 * 60 * 24 * 7);
+    const minimumBuffer = role === "proto" ? 1 : 2;
+    if (gapWeeks < 0) return "Not Realistic";
+    if (gapWeeks < minimumBuffer) return "Tight";
+    return "Feasible";
+  });
+
+  return {
+    statuses,
+    allCompletedOrIrrelevant: builds.some((build) => build.start) &&
+      statuses.every((status) => status === "Completed" || status === "Not Relevant")
+  };
+}
+
 // ─────────────────────────────────────────────────────────────
 // Concierge Chat Prompt (Step 6.3.d)
 // ─────────────────────────────────────────────────────────────
@@ -791,6 +825,8 @@ app.post("/ai-advice", async (req, res) => {
         `If a lane is listed as visible but its data is empty, state that it contains no data rather than flagging it as a risk.`
       : "No timeline lanes are currently visible. Advise the engineer to select at least one lane to get meaningful feedback.";
 
+    const readinessSummary = getReadinessSummary(plan);
+
     const { _visibleLanes, ...planForAI } = plan;
 
     const completion = await client.chat.completions.create({
@@ -801,6 +837,7 @@ app.post("/ai-advice", async (req, res) => {
           role: "user",
           content:
             "Today's date is " + new Date().toISOString().slice(0, 10) + ".\n\n" +
+            "Deterministic build-readiness status is " + JSON.stringify(readinessSummary) + ". Milestones dated before createdDate are completed history, not feasible future work. " +
             laneScope + "\n\n" +
             "Analyze the following component timing plan and return only the JSON object " +
             "in the required schema. No prose, no markdown, no code fences.\n\n" +
@@ -819,8 +856,10 @@ app.post("/ai-advice", async (req, res) => {
     }
 
     const advisory = {
-      overallRisk: parsed.overallRisk || "Yellow",
-      summary: parsed.summary || "",
+      overallRisk: readinessSummary.allCompletedOrIrrelevant ? "Green" : (parsed.overallRisk || "Yellow"),
+      summary: readinessSummary.allCompletedOrIrrelevant
+        ? "Plan Fully Complete — all relevant milestones are completed or not applicable."
+        : (parsed.summary || ""),
       sequencingAndToolingRisk: Array.isArray(parsed.sequencingAndToolingRisk) ? parsed.sequencingAndToolingRisk : [],
       ppapAndSamplingDeviationRisk: Array.isArray(parsed.ppapAndSamplingDeviationRisk) ? parsed.ppapAndSamplingDeviationRisk : [],
       recommendation: Array.isArray(parsed.recommendation) ? parsed.recommendation : []
