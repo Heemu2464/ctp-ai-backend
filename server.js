@@ -169,6 +169,29 @@ async function readPlanFileData(filePath) {
   }
 }
 
+function readOnlyPlanResponse(plan) {
+  const { _filePath, ...publicPlan } = plan;
+  return publicPlan;
+}
+
+function readOnlyError() {
+  return {
+    ok: false,
+    code: "READ_ONLY_PLAN",
+    message: "This plan belongs to another user. Copy it to My Plans before editing."
+  };
+}
+
+function validatePlanPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return "Plan payload must be an object.";
+  }
+  for (const field of ["planId", "carline", "commodity"]) {
+    if (!String(payload[field] || "").trim()) return `${field} is required.`;
+  }
+  return null;
+}
+
 async function getAllPlansForUser(owner) {
   const userDir = path.join(STORAGE_ROOT, "users", owner || "");
   const files = await listJsonFiles(userDir);
@@ -180,7 +203,7 @@ async function getAllPlansForUser(owner) {
   }
 
   return plans
-    .map((plan) => ensureMetadata(plan, owner))
+    .map((plan) => ({ ...ensureMetadata({ ...plan, owner }, owner), owner }))
     .sort((a, b) => (b.lastModifiedDate || "").localeCompare(a.lastModifiedDate || ""));
 }
 
@@ -199,40 +222,62 @@ async function getAllPlansAcrossUsers() {
   return plans.sort((a, b) => (b.lastModifiedDate || "").localeCompare(a.lastModifiedDate || ""));
 }
 
-async function getAllTemplatePlans() {
-  const dir = path.join(STORAGE_ROOT, "shared_templates");
-  const files = await listJsonFiles(dir);
+async function getSharedPlans(currentUser) {
+  const usersRoot = path.join(STORAGE_ROOT, "users");
+  const excludedOwner = normalizeUserName(currentUser);
   const plans = [];
+  let invalidCount = 0;
 
-  for (const file of files) {
-    const plan = await readPlanFileData(file);
-    if (plan) plans.push(ensureMetadata(plan, plan.owner || "shared_templates"));
+  let entries = [];
+  try {
+    entries = await fs.readdir(usersRoot, { withFileTypes: true });
+  } catch {
+    return { plans: [], invalidCount: 0 };
   }
 
-  return plans.sort((a, b) => (b.lastModifiedDate || "").localeCompare(a.lastModifiedDate || ""));
+  for (const entry of entries) {
+    if (!entry.isDirectory() || normalizeUserName(entry.name) === excludedOwner) continue;
+    const owner = normalizeUserName(entry.name);
+    const ownerFiles = await listJsonFiles(path.join(usersRoot, entry.name));
+    for (const file of ownerFiles) {
+      const plan = await readPlanFileData(file);
+      if (!plan) {
+        invalidCount += 1;
+        continue;
+      }
+      plans.push({
+        ...ensureMetadata(plan, owner),
+        owner,
+        readOnly: true,
+        _filePath: file
+      });
+    }
+  }
+
+  return {
+    plans: plans.sort((a, b) => (b.lastModifiedDate || "").localeCompare(a.lastModifiedDate || "")),
+    invalidCount
+  };
 }
 
 function buildPlanPath(owner, plan) {
   const safeOwner = normalizeUserName(owner || "");
   const safePlanId = sanitizeFileName(plan?.planId || plan?.id || `${plan?.carline || "plan"}_${Date.now()}`);
-  const storageDirectory = safeOwner === "shared_templates"
-    ? path.join(STORAGE_ROOT, "shared_templates")
-    : path.join(STORAGE_ROOT, "users", safeOwner || "unknown");
-  return path.join(storageDirectory, `${safePlanId}.json`);
+  return path.join(STORAGE_ROOT, "users", safeOwner || "unknown", `${safePlanId}.json`);
 }
 
-async function findPlanByIdOrFileId(targetId) {
+async function findPlanByIdOrFileId(targetId, requestedOwner = "") {
   const planId = String(targetId || "");
-  const allPlans = await getAllPlansAcrossUsers();
+  const allPlans = requestedOwner
+    ? await getAllPlansForUser(normalizeUserName(requestedOwner))
+    : await getAllPlansAcrossUsers();
   const match = allPlans.find((plan) => {
     const ids = [plan.planId, plan.id, path.basename(plan._filePath || "")];
     return ids.some((entry) => String(entry || "") === planId);
   });
 
   if (match) {
-    const owner = normalizeUserName(match.owner);
-    const filePath = path.join(STORAGE_ROOT, "users", owner, `${sanitizeFileName(match.planId || match.id)}.json`);
-    return { ...match, _filePath: filePath };
+    return { ...match, _filePath: match._filePath || buildPlanPath(match.owner, match) };
   }
 
   return null;
@@ -251,7 +296,16 @@ async function writePlan(plan, currentUser) {
   normalizedPlan.lastModifiedDate = new Date().toISOString();
   normalizedPlan.id = normalizedPlan.planId || normalizedPlan.id;
 
-  await fs.writeFile(filePath, JSON.stringify(normalizedPlan, null, 2), "utf8");
+  const temporaryPath = `${filePath}.tmp`;
+  try {
+    const serialized = JSON.stringify(normalizedPlan, null, 2);
+    await fs.writeFile(temporaryPath, serialized, "utf8");
+    JSON.parse(await fs.readFile(temporaryPath, "utf8"));
+    await fs.rename(temporaryPath, filePath);
+  } catch (error) {
+    await fs.unlink(temporaryPath).catch(() => {});
+    throw error;
+  }
   return { ...normalizedPlan, _filePath: filePath };
 }
 
@@ -279,21 +333,64 @@ app.get("/api/plans/my", async (req, res) => {
 
 app.get("/api/plans/team", async (req, res) => {
   const plans = await getAllPlansAcrossUsers();
-  res.json({ ok: true, plans });
+  res.json({ ok: true, plans: plans.map(readOnlyPlanResponse) });
 });
 
-app.get("/api/plans/templates", async (req, res) => {
-  const plans = await getAllTemplatePlans();
-  res.json({ ok: true, plans });
+app.get("/api/plans/shared", async (req, res) => {
+  const currentUser = resolveCurrentUser(req);
+  req.session.user = currentUser;
+  const result = await getSharedPlans(currentUser);
+  res.json({
+    ok: true,
+    plans: result.plans.map(readOnlyPlanResponse),
+    warningCount: result.invalidCount
+  });
+});
+
+app.get("/api/plans/templates", async (_req, res) => {
+  res.json({ ok: true, plans: [], warningCount: 0 });
+});
+
+app.get("/api/storage/status", async (req, res) => {
+  const currentUser = resolveCurrentUser(req);
+  let available = false;
+  try {
+    await fs.access(STORAGE_ROOT);
+    available = true;
+  } catch {
+    available = false;
+  }
+  const currentUserFolder = path.join(STORAGE_ROOT, "users", currentUser);
+  let writable = false;
+  try {
+    await fs.access(currentUserFolder);
+    await fs.access(currentUserFolder, 2);
+    writable = true;
+  } catch {
+    writable = false;
+  }
+  res.json({
+    available,
+    writable: available && writable,
+    currentUserFolderAvailable: available && writable
+  });
 });
 
 app.get("/api/plans/:id", async (req, res) => {
-  const plan = await findPlanByIdOrFileId(req.params.id);
+  const currentUser = resolveCurrentUser(req);
+  req.session.user = currentUser;
+  const requestedOwner = normalizeUserName(req.query.owner || "");
+  const plan = requestedOwner
+    ? await findPlanByIdOrFileId(req.params.id, requestedOwner)
+    : await findPlanByIdOrFileId(req.params.id);
   if (!plan) {
     return res.status(404).json({ ok: false, error: "Plan not found" });
   }
 
-  return res.json({ ok: true, plan });
+  return res.json({ ok: true, plan: readOnlyPlanResponse({
+    ...plan,
+    readOnly: normalizeUserName(plan.owner) !== normalizeUserName(currentUser)
+  }) });
 });
 
 app.post("/api/plans/save", async (req, res) => {
@@ -301,18 +398,18 @@ app.post("/api/plans/save", async (req, res) => {
     const currentUser = resolveCurrentUser(req);
     req.session.user = currentUser;
     const incomingPlan = req.body || {};
+    const validationError = validatePlanPayload(incomingPlan);
+    if (validationError) return res.status(400).json({ ok: false, error: validationError });
     const plan = ensureMetadata(incomingPlan, currentUser);
 
-    if (!plan.carline || !plan.commodity) {
-      return res.status(400).json({ ok: false, error: "Carline and commodity are required." });
+    const owner = normalizeUserName(currentUser);
+    if (plan.owner && normalizeUserName(plan.owner) !== owner) {
+      return res.status(403).json(readOnlyError());
     }
-
-    const owner = normalizeUserName(plan.owner || currentUser);
-    if (plan.owner && owner !== normalizeUserName(currentUser)) {
-      return res.status(403).json({
-        ok: false,
-        error: `This is a read-only plan owned by ${owner}. Use Save As My Copy to create your own editable version.`
-      });
+    const existingOwnedPlan = await findPlanByIdOrFileId(plan.planId, owner);
+    const existingAnyPlan = existingOwnedPlan || (await getAllPlansAcrossUsers()).find((item) => String(item.planId || item.id) === String(plan.planId));
+    if (existingAnyPlan && normalizeUserName(existingAnyPlan.owner) !== owner) {
+      return res.status(403).json(readOnlyError());
     }
 
     const savedPlan = await writePlan({
@@ -323,7 +420,7 @@ app.post("/api/plans/save", async (req, res) => {
       lastModifiedDate: new Date().toISOString()
     }, currentUser);
 
-    return res.json({ ok: true, plan: savedPlan });
+    return res.json({ ok: true, plan: readOnlyPlanResponse(savedPlan) });
   } catch (error) {
     console.error("Save plan error:", error);
     return res.status(500).json({ ok: false, error: error.message || "Failed to save plan." });
@@ -334,78 +431,44 @@ app.post("/api/plans/copy", async (req, res) => {
   try {
     const currentUser = resolveCurrentUser(req);
     req.session.user = currentUser;
-    const { planId, owner } = req.body || {};
+    const { planId, sourceOwner, carline, commodity, planName } = req.body || {};
     if (!planId) {
       return res.status(400).json({ ok: false, error: "Plan id is required." });
     }
 
-    const sourcePlans = await getAllPlansAcrossUsers();
-    const sourcePlan = sourcePlans.find((plan) => String(plan.planId || plan.id) === String(planId));
+    const sourcePlan = await findPlanByIdOrFileId(planId, normalizeUserName(sourceOwner || ""));
 
     if (!sourcePlan) {
       return res.status(404).json({ ok: false, error: "Plan not found." });
     }
 
-    const sourceOwner = normalizeUserName(sourcePlan.owner || owner || currentUser);
-    const copyId = `${sanitizeFileName(sourcePlan.carline || "copy")}_${sanitizeFileName(sourcePlan.commodity || "plan")}_${Date.now()}`;
+    const copiedFromOwner = normalizeUserName(sourcePlan.owner || "");
+    const requestedName = sanitizeFileName(planName || `${sourcePlan.carline || "copy"}_${sourcePlan.commodity || "plan"}`);
+    let copyId = requestedName;
+    let suffix = 1;
+    while (await fs.access(buildPlanPath(currentUser, { planId: copyId })).then(() => true).catch(() => false)) {
+      copyId = `${requestedName}_${suffix++}`;
+    }
     const copiedPlan = ensureMetadata({
       ...sourcePlan,
       owner: currentUser,
+      carline: String(carline || sourcePlan.carline || "").trim(),
+      commodity: String(commodity || sourcePlan.commodity || "").trim(),
       createdBy: currentUser,
       lastModifiedBy: currentUser,
       createdDate: new Date().toISOString(),
       lastModifiedDate: new Date().toISOString(),
       planId: copyId,
       id: copyId,
-      copiedFrom: sourceOwner,
+      copiedFromOwner,
       copiedFromPlanId: String(sourcePlan.planId || sourcePlan.id || planId)
     }, currentUser);
 
     const saved = await writePlan(copiedPlan, currentUser);
-    return res.json({ ok: true, plan: saved });
+    return res.json({ ok: true, plan: readOnlyPlanResponse(saved) });
   } catch (error) {
     console.error("Copy plan error:", error);
     return res.status(500).json({ ok: false, error: error.message || "Failed to copy plan." });
-  }
-});
-
-app.post("/api/plans/migrate", async (req, res) => {
-  try {
-    const currentUser = resolveCurrentUser(req);
-    req.session.user = currentUser;
-    const incomingPlans = Array.isArray(req.body?.plans) ? req.body.plans : [];
-
-    if (!incomingPlans.length) {
-      return res.json({ ok: true, migrated: 0, plans: [] });
-    }
-
-    const migrated = [];
-    for (const incomingPlan of incomingPlans) {
-      const plan = ensureMetadata(incomingPlan, currentUser);
-      const owner = normalizeUserName(plan.owner || currentUser || "");
-      const ownedPlan = {
-        ...plan,
-        owner,
-        createdBy: normalizeUserName(plan.createdBy || currentUser || owner),
-        lastModifiedBy: normalizeUserName(currentUser),
-        createdDate: plan.createdDate || new Date().toISOString(),
-        lastModifiedDate: new Date().toISOString(),
-        planId: plan.planId || plan.id || `${sanitizeFileName(plan.carline || "plan")}_${Date.now()}`
-      };
-
-      const existing = await findPlanByIdOrFileId(ownedPlan.planId);
-      if (existing && normalizeUserName(existing.owner || owner) === owner) {
-        continue;
-      }
-
-      const saved = await writePlan(ownedPlan, currentUser);
-      migrated.push(saved);
-    }
-
-    return res.json({ ok: true, migrated: migrated.length, plans: migrated });
-  } catch (error) {
-    console.error("Migrate plans error:", error);
-    return res.status(500).json({ ok: false, error: error.message || "Failed to migrate plans." });
   }
 });
 
@@ -419,7 +482,7 @@ app.delete("/api/plans/:id", async (req, res) => {
     }
 
     if (normalizeUserName(plan.owner || "") !== normalizeUserName(currentUser)) {
-      return res.status(403).json({ ok: false, error: "You can only delete your own plans." });
+      return res.status(403).json(readOnlyError());
     }
 
     const filePath = plan._filePath || buildPlanPath(plan.owner, plan);
