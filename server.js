@@ -215,7 +215,10 @@ async function getAllTemplatePlans() {
 function buildPlanPath(owner, plan) {
   const safeOwner = normalizeUserName(owner || "");
   const safePlanId = sanitizeFileName(plan?.planId || plan?.id || `${plan?.carline || "plan"}_${Date.now()}`);
-  return path.join(STORAGE_ROOT, "users", safeOwner || "unknown", `${safePlanId}.json`);
+  const storageDirectory = safeOwner === "shared_templates"
+    ? path.join(STORAGE_ROOT, "shared_templates")
+    : path.join(STORAGE_ROOT, "users", safeOwner || "unknown");
+  return path.join(storageDirectory, `${safePlanId}.json`);
 }
 
 async function findPlanByIdOrFileId(targetId) {
