@@ -5,7 +5,9 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import session from "express-session";
-import { AzureOpenAI } from "openai";
+import OpenAI, { AzureOpenAI } from "openai";
+import multer from "multer";
+import { PDFParse } from "pdf-parse";
 
 dotenv.config();
 
@@ -17,12 +19,24 @@ const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:5005,http:
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+const allowedOriginPorts = new Set(["5005", "5173"]);
 
 app.use(cors({
-  origin: allowedOrigins,
+  // The app is shared over the LAN via hostname/IP (see start-timing-planner.bat), not just
+  // "localhost" — a static origin allow-list rejected every colleague's browser with a silent
+  // CORS failure (save/load requests never even reached the server). Any origin on the app's
+  // own port is allowed so LAN access works, while still not opening this up to the internet.
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true); // same-origin, curl, Postman, etc.
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    try {
+      if (allowedOriginPorts.has(new URL(origin).port)) return callback(null, true);
+    } catch { /* malformed Origin header — fall through to reject */ }
+    return callback(new Error("Not allowed by CORS"));
+  },
   credentials: true
 }));
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "50mb" }));
 app.use(session({
   secret: process.env.SESSION_SECRET || "btv-planner-session-secret",
   resave: false,
@@ -36,11 +50,102 @@ app.use(session({
 
 const PORT = Number(process.env.PORT || 5000);
 const STORAGE_ROOT = path.resolve(process.env.BTV_STORAGE_ROOT || path.join(__dirname, "..", "BTV_PLANNER"));
+const LLM_PROVIDER = String(process.env.LLM_PROVIDER || (process.env.OPENAI_API_KEY ? "openai" : "azure")).toLowerCase();
+const LLM_MODEL = process.env.OPENAI_MODEL || process.env.MB_GENAI_MODEL || "gpt-4.1-mini";
 
-const client = new AzureOpenAI({
-  apiKey:     process.env.MB_GENAI_API_KEY,
-  apiVersion: process.env.MB_GENAI_API_VERSION,
-  endpoint:   process.env.MB_GENAI_ENDPOINT
+const client = LLM_PROVIDER === "openai"
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : new AzureOpenAI({
+    apiKey: process.env.MB_GENAI_API_KEY,
+    apiVersion: process.env.MB_GENAI_API_VERSION,
+    endpoint: process.env.MB_GENAI_ENDPOINT
+  });
+
+function normalizeReferenceImages(images) {
+  if (!Array.isArray(images)) return [];
+  return images
+    .filter((img) => typeof img === "string" && img.startsWith("data:image/"))
+    .slice(0, 4)
+    .map((img) => ({ type: "image_url", image_url: { url: img } }));
+}
+
+function buildUserContent(text, referenceImages = []) {
+  const imageParts = normalizeReferenceImages(referenceImages);
+  if (!imageParts.length) return String(text || "");
+  return [
+    { type: "text", text: String(text || "") },
+    ...imageParts
+  ];
+}
+
+// Adds the raw PDF as a file part so the model sees layout/columns, not just extracted text.
+function buildUserContentWithPdf(text, referenceImages = [], pdfDataUrl = "", pdfFilename = "supplier.pdf") {
+  const parts = [{ type: "text", text: String(text || "") }];
+  if (typeof pdfDataUrl === "string" && pdfDataUrl.startsWith("data:application/pdf")) {
+    parts.push({
+      type: "file",
+      file: { file_data: pdfDataUrl, filename: pdfFilename }
+    });
+  }
+  parts.push(...normalizeReferenceImages(referenceImages));
+  return parts;
+}
+
+async function requestModel(messages, options = {}) {
+  const payload = {
+    model: LLM_MODEL,
+    messages
+  };
+  if (options.maxTokens) payload.max_tokens = options.maxTokens;
+  const completion = await client.chat.completions.create(payload);
+  return completion.choices?.[0]?.message?.content || "";
+}
+
+// OpenAI chat.completions silently drops PDF file parts; Responses API is the only path that
+// actually reads PDFs. Used for supplier import parity with Copilot chat.
+async function requestModelResponsesWithPdf({ system, userText, pdfDataUrl, pdfFilename, referenceImages = [] }) {
+  if (!client.responses || typeof client.responses.create !== "function") {
+    throw new Error("responses_api_unavailable");
+  }
+  const userContent = [{ type: "input_text", text: String(userText || "") }];
+  if (typeof pdfDataUrl === "string" && pdfDataUrl.startsWith("data:application/pdf")) {
+    userContent.push({ type: "input_file", filename: pdfFilename || "supplier.pdf", file_data: pdfDataUrl });
+  }
+  const images = Array.isArray(referenceImages)
+    ? referenceImages.filter((u) => typeof u === "string" && u.startsWith("data:image/")).slice(0, 4)
+    : [];
+  images.forEach((url) => userContent.push({ type: "input_image", image_url: url, detail: "auto" }));
+
+  const payload = {
+    model: LLM_MODEL,
+    temperature: 0,
+    max_output_tokens: 8000,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: String(system || "") }] },
+      { role: "user", content: userContent }
+    ]
+  };
+
+  const response = await client.responses.create(payload);
+  if (typeof response.output_text === "string" && response.output_text) return response.output_text;
+  const outputs = response.output || [];
+  for (const item of outputs) {
+    const parts = item?.content || [];
+    for (const part of parts) {
+      if (typeof part?.text === "string" && part.text) return part.text;
+      if (typeof part?.text?.value === "string" && part.text.value) return part.text.value;
+    }
+  }
+  return "";
+}
+
+const pdfUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+  fileFilter: (_req, file, callback) => {
+    const isPdf = file.mimetype === "application/pdf" || file.originalname.toLowerCase().endsWith(".pdf");
+    callback(isPdf ? null : new Error("PDF files only"), isPdf);
+  }
 });
 
 function normalizeUserName(value) {
@@ -231,8 +336,12 @@ async function getSharedPlans(currentUser) {
   let entries = [];
   try {
     entries = await fs.readdir(usersRoot, { withFileTypes: true });
-  } catch {
-    return { plans: [], invalidCount: 0 };
+  } catch (error) {
+    // Surface the real reason (e.g. network share unreachable/permission denied) instead of
+    // silently reporting zero shared plans, which looks identical to "no one has shared plans".
+    const err = new Error(`Could not list the shared plans folder: ${error.message}`);
+    err.cause = error;
+    throw err;
   }
 
   for (const entry of entries) {
@@ -283,6 +392,17 @@ async function findPlanByIdOrFileId(targetId, requestedOwner = "") {
   return null;
 }
 
+// Turns raw Node.js filesystem error codes into messages that actually help someone diagnose a
+// network-share problem, instead of a generic "Failed to save plan."
+function describeStorageError(error) {
+  const code = error?.code || "";
+  if (code === "ENOENT") return `The plan storage folder could not be found (${STORAGE_ROOT}). Check the network share path/connection.`;
+  if (code === "EACCES" || code === "EPERM") return "Access denied writing to the network plan storage folder. Check your share permissions.";
+  if (code === "ETIMEDOUT" || code === "ENETUNREACH" || code === "EHOSTUNREACH") return "The network plan storage share timed out/unreachable. Check your VPN or network connection.";
+  if (code === "ENOSPC") return "The network plan storage share is out of disk space.";
+  return error?.message || "Failed to save plan.";
+}
+
 async function writePlan(plan, currentUser) {
   const normalizedPlan = ensureMetadata(plan, currentUser);
   const owner = normalizeUserName(normalizedPlan.owner || currentUser || "");
@@ -301,7 +421,15 @@ async function writePlan(plan, currentUser) {
     const serialized = JSON.stringify(normalizedPlan, null, 2);
     await fs.writeFile(temporaryPath, serialized, "utf8");
     JSON.parse(await fs.readFile(temporaryPath, "utf8"));
-    await fs.rename(temporaryPath, filePath);
+    try {
+      await fs.rename(temporaryPath, filePath);
+    } catch (renameError) {
+      // Some network/SMB shares reject atomic rename (EPERM/EXDEV) even within the same UNC
+      // root — fall back to a direct write so a save never silently fails on those drives.
+      console.warn("Rename failed, falling back to direct write:", renameError.message);
+      await fs.writeFile(filePath, serialized, "utf8");
+      await fs.unlink(temporaryPath).catch(() => {});
+    }
   } catch (error) {
     await fs.unlink(temporaryPath).catch(() => {});
     throw error;
@@ -337,14 +465,19 @@ app.get("/api/plans/team", async (req, res) => {
 });
 
 app.get("/api/plans/shared", async (req, res) => {
-  const currentUser = resolveCurrentUser(req);
-  req.session.user = currentUser;
-  const result = await getSharedPlans(currentUser);
-  res.json({
-    ok: true,
-    plans: result.plans.map(readOnlyPlanResponse),
-    warningCount: result.invalidCount
-  });
+  try {
+    const currentUser = resolveCurrentUser(req);
+    req.session.user = currentUser;
+    const result = await getSharedPlans(currentUser);
+    res.json({
+      ok: true,
+      plans: result.plans.map(readOnlyPlanResponse),
+      warningCount: result.invalidCount
+    });
+  } catch (error) {
+    console.error("Shared plans error:", error);
+    res.status(500).json({ ok: false, error: error.message || "Failed to load shared plans.", plans: [] });
+  }
 });
 
 app.get("/api/plans/templates", async (_req, res) => {
@@ -406,9 +539,11 @@ app.post("/api/plans/save", async (req, res) => {
     if (plan.owner && normalizeUserName(plan.owner) !== owner) {
       return res.status(403).json(readOnlyError());
     }
+    // Plans are stored per-owner (users/<owner>/<planId>.json), so two different users creating
+    // a plan for the same carline+commodity never actually collide on disk — only check whether
+    // *this user's own* existing file for that planId belongs to someone else somehow.
     const existingOwnedPlan = await findPlanByIdOrFileId(plan.planId, owner);
-    const existingAnyPlan = existingOwnedPlan || (await getAllPlansAcrossUsers()).find((item) => String(item.planId || item.id) === String(plan.planId));
-    if (existingAnyPlan && normalizeUserName(existingAnyPlan.owner) !== owner) {
+    if (existingOwnedPlan && normalizeUserName(existingOwnedPlan.owner) !== owner) {
       return res.status(403).json(readOnlyError());
     }
 
@@ -423,7 +558,7 @@ app.post("/api/plans/save", async (req, res) => {
     return res.json({ ok: true, plan: readOnlyPlanResponse(savedPlan) });
   } catch (error) {
     console.error("Save plan error:", error);
-    return res.status(500).json({ ok: false, error: error.message || "Failed to save plan." });
+    return res.status(500).json({ ok: false, error: describeStorageError(error) });
   }
 });
 
@@ -546,7 +681,7 @@ function getReadinessSummary(plan) {
   const gates = [["proto", "protoParts"], ["series", "eswft"], ["pro", "ppap"]];
 
   const statuses = gates.map(([role, key]) => {
-    const build = builds.find((item) => item.role === role);
+    const build = builds.find((item) => (item.type || item.role) === role);
     const milestone = milestones[key] || {};
     const buildStart = build?.start || "";
     const milestoneDate = milestone.overrideDate || milestone.plannedDate || "";
@@ -728,6 +863,400 @@ function safeParseAIResponse(raw) {
   return null;
 }
 
+function safeParsePDFPlanResponse(raw) {
+  const parsed = safeParseAIResponse(raw);
+  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.detectedBuilds)) return null;
+
+  const allowedTypes = new Set(["proto", "series", "pro", "sop", "milestone", "tooling", "validation", "custom"]);
+  const allowedConfidence = new Set(["high", "medium", "low"]);
+
+  const GERMAN_MONTHS = {
+    januar: "01", jan: "01",
+    februar: "02", feb: "02",
+    märz: "03", maerz: "03", mrz: "03", mar: "03",
+    april: "04", apr: "04",
+    mai: "05", may: "05",
+    juni: "06", jun: "06",
+    juli: "07", jul: "07",
+    august: "08", aug: "08",
+    september: "09", sep: "09", sept: "09",
+    oktober: "10", okt: "10", oct: "10",
+    november: "11", nov: "11",
+    dezember: "12", dez: "12", dec: "12"
+  };
+
+  const normalizeDateIso = (d) => {
+    if (!d) return "";
+    const str = String(d).trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+
+    // Chinese date format: 2026年9月28日
+    const zhMatch = str.match(/(\d{4})[年/-](\d{1,2})[月/-](\d{1,2})/);
+    if (zhMatch) {
+      return `${zhMatch[1]}-${zhMatch[2].padStart(2, "0")}-${zhMatch[3].padStart(2, "0")}`;
+    }
+
+    // Dot-separated: European/German DD.MM.YYYY (e.g. 28.09.2026)
+    const dotMatch = str.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+    if (dotMatch) {
+      return `${dotMatch[3]}-${dotMatch[2].padStart(2, "0")}-${dotMatch[1].padStart(2, "0")}`;
+    }
+
+    // Slash/dash-separated: Excel's default US locale export is MM/DD/YYYY (e.g. 11/22/2027);
+    // swap to DD/MM if the first number can't possibly be a month (e.g. 28/09/2026).
+    const slashMatch = str.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+    if (slashMatch) {
+      let month = parseInt(slashMatch[1], 10);
+      let day = parseInt(slashMatch[2], 10);
+      if (month > 12 && day <= 12) { [month, day] = [day, month]; }
+      if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+        return `${slashMatch[3]}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+      }
+    }
+
+    // German / English text: 15. März 2026, 28. Sept 2026, 15 Jan 2026
+    const textDateMatch = str.match(/^(\d{1,2})\.?\s+([a-zA-ZäöüÄÖÜß]+)\.?\s+(\d{4})$/);
+    if (textDateMatch) {
+      const day = textDateMatch[1].padStart(2, "0");
+      const monthKey = textDateMatch[2].toLowerCase().replace(/ä/g, "ae").replace(/ö/g, "oe").replace(/ü/g, "ue");
+      const month = GERMAN_MONTHS[monthKey] || GERMAN_MONTHS[textDateMatch[2].toLowerCase()] || "01";
+      const year = textDateMatch[3];
+      return `${year}-${month}-${day}`;
+    }
+
+    // Calendar week in German/English: KW 37 2026, CW 37 2026, WK 37 2026
+    const kwMatch = str.match(/(?:kw|cw|wk)\s*(\d{1,2})\D+(\d{4})/i);
+    if (kwMatch) {
+      const week = parseInt(kwMatch[1], 10);
+      const year = parseInt(kwMatch[2], 10);
+      const jan4 = new Date(Date.UTC(year, 0, 4));
+      const jan4Day = jan4.getUTCDay() || 7;
+      const week1Monday = new Date(jan4);
+      week1Monday.setUTCDate(jan4.getUTCDate() - jan4Day + 1);
+      const target = new Date(week1Monday);
+      target.setUTCDate(week1Monday.getUTCDate() + (week - 1) * 7);
+      return target.toISOString().slice(0, 10);
+    }
+
+    const parsedDate = new Date(str);
+    return Number.isNaN(parsedDate.getTime()) ? "" : parsedDate.toISOString().slice(0, 10);
+  };
+
+  const detectedBuilds = parsed.detectedBuilds
+    .filter((build) => build && typeof build === "object")
+    .map((build) => {
+      const name = String(build.name || build.label || "Imported milestone").trim();
+      const start = normalizeDateIso(build.start || build.startDate || build.date);
+      const end = normalizeDateIso(build.end || build.endDate || build.finishDate || build.finish || start);
+      const startDate = start || end;
+      const endDate = end || start;
+      const type = allowedTypes.has(build.type) ? build.type : allowedTypes.has(build.role) ? build.role : "custom";
+      const hasValidDate = /^\d{4}-\d{2}-\d{2}$/.test(startDate);
+      const confidence = !hasValidDate ? "low" : (allowedConfidence.has(build.confidence) ? build.confidence : "high");
+      const duration = String(build.duration || "").trim();
+      const category = String(build.category || build.group || build.parentTask || "").trim();
+      const isMilestone = build.isMilestone !== undefined ? Boolean(build.isMilestone) : (startDate === endDate);
+      return {
+        name,
+        label: name,
+        date: startDate,
+        start: startDate,
+        endDate,
+        end: endDate,
+        duration,
+        category,
+        isMilestone,
+        type,
+        role: type,
+        confidence
+      };
+    })
+    // Keep rows even without a recognized date — the frontend lets the user fill missing
+    // start/end dates manually instead of losing the build/milestone entirely.
+    .filter((build) => build.name)
+    .sort((a, b) => {
+      const aHas = /^\d{4}-\d{2}-\d{2}$/.test(a.start);
+      const bHas = /^\d{4}-\d{2}-\d{2}$/.test(b.start);
+      if (aHas !== bHas) return aHas ? -1 : 1;
+      if (!aHas) return 0;
+      return new Date(a.start) - new Date(b.start);
+    });
+
+  return {
+    carline: parsed.carline == null ? null : String(parsed.carline).trim(),
+    projectTitle: parsed.projectTitle == null ? null : String(parsed.projectTitle).trim(),
+    detectedBuilds,
+    unparsedRows: Array.isArray(parsed.unparsedRows) ? parsed.unparsedRows.map((row) => String(row)) : [],
+    notes: typeof parsed.notes === "string" ? parsed.notes : ""
+  };
+}
+
+const PDF_PLAN_SYSTEM_PROMPT = [
+  "You are a senior automotive BTV component timing planner and project schedule specialist fluent in German (Deutsch), English, and Chinese engineering documents.",
+  "Your task is to analyze documents (MS Project exports, Gantt charts, supplier timelines, Excel tables, PDF reports, PowerPoint timeline slides, screenshots) and extract EVERY milestone, vehicle build gate, validation phase, tooling period, and task.",
+  "DO NOT skip or slip any milestone or task. Make sure all summary phases, sub-tasks, and major milestones are extracted with both start and end dates.",
+  "",
+  "German Language & Terminology Comprehension:",
+  "- Fully support German documents and German engineering terms:",
+  "  * 'Lieferantennominierung', 'Vergabe', 'Nominierung' -> Supplier Nomination",
+  "  * 'Konzeptfreigabe', 'P-Design Freeze', 'P-Konzept' -> P Design Freeze",
+  "  * 'Zeichnungsfreigabe P', 'P-Freigabe', 'Datenfreigabe P' -> P-Release",
+  "  * 'Prototypenwerkzeug', 'Proto-Werkzeugstart', 'Werkzeugerstellung Proto' -> Proto Tool Start",
+  "  * 'Musterteile', 'Prototypenteile', 'Musterbereitstellung', 'B-Muster', 'C-Muster' -> Proto Parts / Samples",
+  "  * 'Serienkonstruktionsfreigabe', 'W-Design Freeze', 'Konstruktionsfreeze' -> W Design Freeze",
+  "  * 'Serienzeichnungsfreigabe', 'W-Freigabe', 'Datenfreigabe W' -> W-Release",
+  "  * 'Serienwerkzeug', 'Werkzeugerstellung Serie', 'Werkzeugbau', 'Werkzeugstart' -> Series Tool Start",
+  "  * 'Erste Teile aus Serienwerkzeug', 'ESWFT' -> ESWFT",
+  "  * 'Rohlingfreigabe', 'Blank Release' -> Blank Release",
+  "  * 'Rohling Design Freeze', 'Blank Design Freeze' -> Blank Design Freeze",
+  "  * 'Teile aus Serienwerkzeug', 'Serienfallende Teile', 'SWFT' -> SWFT",
+  "  * 'Erstbemusterung', 'PPAP', 'EMPB', 'ISIR', 'VDA 2 Freigabe' -> PPAP / Approval",
+  "  * 'Serienanlauf', 'Produktionsstart', 'SOP', 'Start of Production' -> SOP",
+  "  * 'Erprobung', 'Validierung', 'Dauerlauf', 'Bauteilprüfung', 'Versuch' -> Testing / Validation",
+  "  * 'Baustufe', 'Prototypenbau', 'Vorserie', 'Nullserie', 'AF_BL', 'BF_BL', 'PT0', 'PT1', 'PT2' -> Vehicle Build Phases",
+  "",
+  "Return exactly one valid JSON object and no markdown or prose outside it.",
+  "Schema:",
+  '{',
+  '  "carline": "string or null (e.g. X192, BR254, BR214)",',
+  '  "projectTitle": "string or null",',
+  '  "detectedBuilds": [',
+  '    {',
+  '      "name": "string (full descriptive milestone/task name)",',
+  '      "label": "string",',
+  '      "start": "YYYY-MM-DD",',
+  '      "end": "YYYY-MM-DD",',
+  '      "duration": "string or null (e.g. 20 days, 50 days, 0 days, 2 wks)",',
+  '      "isMilestone": true|false,',
+  '      "category": "string (e.g. Key Internal Milestones, Design validation, Tooling / Fixture, Validation, Industrialization)",',
+  '      "type": "proto|series|pro|sop|milestone|tooling|validation|custom",',
+  '      "confidence": "high|medium|low"',
+  '    }',
+  '  ],',
+  '  "unparsedRows": ["string"],',
+  '  "notes": "string"',
+  '}',
+  "",
+  "Extraction & Normalization Rules:",
+  "1. Dates: Normalize all date formats to YYYY-MM-DD. Handle German/European dates (e.g. 28.09.2026, 15. März 2026, KW 37 2026), Chinese dates (2026年9月28日), and ISO dates.",
+  "1a. If a row provides a calendar week range (e.g. CW34-CW36 / 2026), compute exact dates as: start = Monday of first CW, end = Sunday of last CW.",
+  "1b. If explicit Start Date and End Date columns are visible, those values take precedence over inferred dates.",
+  "1c. Never use document metadata/header dates (e.g. 'Datum', 'Data as of') as milestone row dates.",
+  "2. Start & End Dates: Milestone Name, Start Date, and End Date are mandatory fields. For duration activities, capture exact start and finish dates. For point-in-time milestones, set start date equal to end date.",
+  "3. Role/Type classification:",
+  "   - Prototype vehicle builds (Proto Build 1 BL1, Proto Build 2 BL2, PVV, E-Vehicles, Prototypenfahrzeuge) -> 'proto'",
+  "   - Series vehicle builds (AF_BL, BF_BL, series, Vorserie) -> 'series'",
+  "   - Production/Trial builds & Approvals (PT0, PT1, PT2, Pro1, Pro2, PPAP, Erstbemusterung, Nullserie) -> 'pro'",
+  "   - SOP / Serienanlauf / Start of Production -> 'sop'",
+  "   - Tooling activities (Werkzeugbau, Tooling) -> 'tooling'",
+  "   - Validation / Testing activities (Erprobung, Validierung, Testing) -> 'validation'",
+  "   - Milestones / Gate releases (Freigabe, Freeze) -> 'milestone'",
+  "   - Use 'custom' only when no specific type applies.",
+  "4. Maintain proper chronological order.",
+  "",
+  "Calendar-week Gantt tables (mandatory rules when the source has CW/KW/Week columns):",
+  "- Treat the calendar-week band spanning consecutive columns as the exact duration of that row's activity.",
+  "- Compute Start Date = Monday of the FIRST calendar week in the band (using ISO week and the year label above that column).",
+  "- Compute End Date = Sunday of the LAST calendar week in the band.",
+  "- Yellow, orange, green or otherwise highlighted cells define the milestone span for that row — treat the highlighted cell range as the authoritative date range for that row.",
+  "- If a row's activity name column shows 'Nomination', 'Design Release', 'Tool Nomination', 'Production Serial Tool', 'FOT', 'Shipment', 'Inspection', 'PPAP', 'SOP' etc., use that exact name; do not merge into a single generic label.",
+  "- Never share dates across rows: each row's dates come from its own highlighted band, not from the row above or below.",
+  "- If a row's highlighted band starts in year N and ends in year N+1, roll the year forward at the CW1 wraparound.",
+  "- Set confidence = 'high' when the band is clearly visible in a color-coded PDF page; use 'medium' only when the CW range is inferred purely from text with no visible band."
+].join("\n");
+
+app.post("/import-plan-from-pdf", (req, res) => {
+  pdfUpload.single("file")(req, res, async (uploadError) => {
+    if (uploadError) {
+      const isTooLarge = uploadError.code === "LIMIT_FILE_SIZE";
+      return res.status(isTooLarge ? 413 : 400).json({
+        error: isTooLarge ? "file_too_large" : "invalid_pdf",
+        message: isTooLarge ? "PDF files must be 25 MB or smaller." : uploadError.message || "Please upload a PDF file."
+      });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: "missing_file", message: "Please select a PDF file to import." });
+    }
+
+    let parser;
+    try {
+      parser = new PDFParse({ data: req.file.buffer });
+      const result = await parser.getText();
+      const text = String(result.text || "").trim();
+      if (text.replace(/\s/g, "").length < 20) {
+        return res.status(422).json({
+          error: "no_text_layer",
+          message: "This PDF appears to be scanned or image-based. Text extraction is not supported yet."
+        });
+      }
+      return res.json({ ok: true, text, pageCount: result.total || result.pages?.length || 0 });
+    } catch (error) {
+      console.error("PDF extraction error:", error);
+      return res.status(422).json({ error: "pdf_extraction_failed", message: "This PDF could not be read. Please try a text-based PDF or use manual entry." });
+    } finally {
+      parser?.destroy?.();
+    }
+  });
+});
+
+app.post("/ai-parse-plan-pdf", async (req, res) => {
+  try {
+    const {
+      text,
+      carline = "",
+      commodity = "",
+      templateSummary = "",
+      userGuidance = "",
+      referenceImages = []
+    } = req.body || {};
+    if (typeof text !== "string" || text.trim().length < 20) {
+      return res.status(400).json({ error: "missing_text", message: "Extracted PDF text is required." });
+    }
+
+    const userPrompt = () => [
+      userGuidance
+        ? `PRIORITY USER GUIDANCE (must take precedence over any default assumption):\n${String(userGuidance).slice(0, 4000)}`
+        : "No user extraction guidance was provided.",
+      "Today's date is " + new Date().toISOString().slice(0, 10) + ".",
+      carline ? `User-entered carline: ${carline}` : "No carline was entered by the user.",
+      commodity ? `Selected commodity: ${commodity}` : "No commodity was selected.",
+      templateSummary ? `Commodity template context: ${templateSummary}` : "No commodity template context is available.",
+      Array.isArray(referenceImages) && referenceImages.length ? `Reference images attached: ${Math.min(referenceImages.length, 4)} (use them to disambiguate columns and colors).` : "No reference images were attached.",
+      "Use the extracted supplier document text below as the source of truth.",
+      "Return exactly one valid JSON object matching the schema. No prose, no markdown.",
+      "Extracted PDF text (lossy plain-text dump):",
+      text.slice(0, 250000)
+    ].join("\n\n");
+
+    async function requestStructuredPlan(reminder = "") {
+      const promptText = userPrompt() + (reminder ? `\n\n${reminder}` : "");
+      const raw = await requestModel([
+        { role: "system", content: PDF_PLAN_SYSTEM_PROMPT },
+        { role: "user", content: buildUserContent(promptText, referenceImages) }
+      ]);
+      return raw;
+    }
+
+    function parseQualityScore(parsedPlan) {
+      if (!parsedPlan || !Array.isArray(parsedPlan.detectedBuilds)) return -1;
+      const rows = parsedPlan.detectedBuilds;
+      const validDates = rows.filter((r) => /^\d{4}-\d{2}-\d{2}$/.test(r.start) && /^\d{4}-\d{2}-\d{2}$/.test(r.end)).length;
+      const nonZeroSpans = rows.filter((r) => r.start && r.end && r.start !== r.end).length;
+      const highOrMedium = rows.filter((r) => r.confidence === "high" || r.confidence === "medium").length;
+      return (validDates * 3) + (highOrMedium * 2) + nonZeroSpans;
+    }
+
+    const firstRaw = await requestStructuredPlan();
+    let parsed = safeParsePDFPlanResponse(firstRaw);
+    let lastRaw = firstRaw;
+    if (!parsed) {
+      const secondRaw = await requestStructuredPlan("Reminder: your previous response was invalid. Return valid JSON only, matching the exact schema.");
+      lastRaw = secondRaw;
+      parsed = safeParsePDFPlanResponse(secondRaw);
+    }
+    if (!parsed) {
+      const snippet = String(lastRaw || "").slice(0, 400).replace(/\s+/g, " ");
+      console.error("[ai-parse-plan-pdf] AI response could not be parsed. Snippet:", snippet);
+      return res.status(502).json({
+        error: "invalid_ai_response",
+        message: "The PDF was read, but the AI could not structure it. You can continue with manual plan creation.",
+        debug: { modelSnippet: snippet, provider: LLM_PROVIDER, model: LLM_MODEL }
+      });
+    }
+
+    // Second (and if needed third) targeted pass: re-read the source text specifically for any
+    // rows the first pass could not date, instead of leaving the user to hunt for them manually.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const missingDateNames = parsed.detectedBuilds
+        .filter((b) => b.confidence === "low" || !/^\d{4}-\d{2}-\d{2}$/.test(b.start))
+        .map((b) => b.name);
+      if (!missingDateNames.length) break;
+      const reminder = [
+        "Look again, very carefully, specifically for the start and end dates of these items — they were missed on the previous pass:",
+        missingDateNames.map((n) => `- ${n}`).join("\n"),
+        "Re-scan the extracted text for any date, calendar week, or duration near these names and return the FULL corrected list of all items (not just these)."
+      ].join("\n");
+      const retryParsed = safeParsePDFPlanResponse(await requestStructuredPlan(reminder));
+      if (!retryParsed) break;
+      const retryByName = new Map(retryParsed.detectedBuilds.map((b) => [b.name.toLowerCase().trim(), b]));
+      let improved = false;
+      parsed.detectedBuilds = parsed.detectedBuilds.map((b) => {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(b.start) && b.confidence !== "low") return b;
+        const match = retryByName.get(b.name.toLowerCase().trim());
+        if (match && /^\d{4}-\d{2}-\d{2}$/.test(match.start)) { improved = true; return match; }
+        return b;
+      });
+      if (!improved) break;
+    }
+
+    // Verification pass for week-based schedules: improves cases where models return plausible
+    // but row-shifted dates by forcing a second extraction anchored to CW/KW logic.
+    if (/\b(?:kw|cw|wk)\b/i.test(text) || userGuidance) {
+      const verificationReminder = [
+        "Critical verification pass:",
+        "- Re-extract all rows and align each milestone/task date to its own row.",
+        "- Never use report metadata dates such as 'Datum', 'Data as of', or header dates as milestone dates.",
+        "- If calendar week ranges are present (e.g. CW34-CW36 / 2026), compute exact dates: start=Monday of first CW, end=Sunday of last CW.",
+        "- If explicit Start Date / End Date columns are present, they override inferred dates.",
+        "- Keep the same schema and return the full corrected list."
+      ].join("\n");
+      const verified = safeParsePDFPlanResponse(await requestStructuredPlan(verificationReminder));
+      if (verified && parseQualityScore(verified) >= parseQualityScore(parsed)) parsed = verified;
+    }
+
+    return res.json({ ok: true, ...parsed });
+  } catch (error) {
+    console.error("AI PDF parsing error:", error);
+    const cause = String(error?.message || "Unknown provider error").slice(0, 500);
+    return res.status(500).json({
+      error: "ai_parse_failed",
+      message: `The PDF could not be converted into a plan: ${cause}`,
+      debug: { provider: LLM_PROVIDER, model: LLM_MODEL }
+    });
+  }
+});
+
+app.post("/ai-parse-plan-screenshot", async (req, res) => {
+  try {
+    const { image, carline = "", commodity = "", userGuidance = "", referenceImages = [] } = req.body || {};
+    if (typeof image !== "string" || !image.startsWith("data:image/")) {
+      return res.status(400).json({ error: "missing_image", message: "A screenshot image is required." });
+    }
+
+    const baseText = `Today's date is ${new Date().toISOString().slice(0, 10)}. Extract the visible table or milestone data from this screenshot. User carline: ${carline || "unknown"}. Commodity: ${commodity || "unknown"}. ${userGuidance ? `User extraction guidance (highest priority): ${String(userGuidance).slice(0, 4000)}.` : "No user extraction guidance was provided."} Return only the required JSON object.`;
+
+    async function requestScreenshotParse(extraReminder = "") {
+      const allImages = [image, ...(Array.isArray(referenceImages) ? referenceImages : [])];
+      const raw = await requestModel([
+        { role: "system", content: PDF_PLAN_SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: buildUserContent(`${baseText}${extraReminder ? `\n\n${extraReminder}` : ""}`, allImages)
+        }
+      ]);
+      return safeParsePDFPlanResponse(raw);
+    }
+
+    let parsed = await requestScreenshotParse();
+    if (parsed) {
+      const rows = parsed.detectedBuilds || [];
+      const lowCount = rows.filter((r) => r.confidence === "low").length;
+      if (rows.length && lowCount / rows.length >= 0.35) {
+        parsed = await requestScreenshotParse(
+          "Verification pass: align each milestone row to its own date cells; if CW/KW ranges are visible, compute Monday-Sunday boundaries; never use header metadata dates as row dates."
+        ) || parsed;
+      }
+    }
+    if (!parsed) {
+      return res.status(502).json({ error: "invalid_ai_response", message: "The screenshot was read, but the AI could not structure it. You can continue with manual entry." });
+    }
+    return res.json({ ok: true, ...parsed });
+  } catch (error) {
+    console.error("AI screenshot parsing error:", error);
+    return res.status(500).json({ error: "screenshot_parse_failed", message: "The screenshot could not be converted into rows. You can continue with manual entry." });
+  }
+});
+
 function safeParseAIMilestones(raw) {
   if (!raw || typeof raw !== "string") return null;
   let text = raw.trim();
@@ -829,25 +1358,20 @@ app.post("/ai-advice", async (req, res) => {
 
     const { _visibleLanes, ...planForAI } = plan;
 
-    const completion = await client.chat.completions.create({
-      model: process.env.MB_GENAI_MODEL,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        {
-          role: "user",
-          content:
-            "Today's date is " + new Date().toISOString().slice(0, 10) + ".\n\n" +
-            "Deterministic build-readiness status is " + JSON.stringify(readinessSummary) + ". Milestones dated before createdDate are completed history, not feasible future work. " +
-            laneScope + "\n\n" +
-            "Analyze the following component timing plan and return only the JSON object " +
-            "in the required schema. No prose, no markdown, no code fences.\n\n" +
-            "Plan JSON:\n" +
-            JSON.stringify(planForAI)
-        }
-      ]
-    });
-
-    const rawContent = completion.choices?.[0]?.message?.content || "";
+    const rawContent = await requestModel([
+      { role: "system", content: SYSTEM_PROMPT },
+      {
+        role: "user",
+        content:
+          "Today's date is " + new Date().toISOString().slice(0, 10) + ".\n\n" +
+          "Deterministic build-readiness status is " + JSON.stringify(readinessSummary) + ". Milestones dated before createdDate are completed history, not feasible future work. " +
+          laneScope + "\n\n" +
+          "Analyze the following component timing plan and return only the JSON object " +
+          "in the required schema. No prose, no markdown, no code fences.\n\n" +
+          "Plan JSON:\n" +
+          JSON.stringify(planForAI)
+      }
+    ]);
     const parsed = safeParseAIResponse(rawContent);
 
     if (!parsed) {
@@ -874,7 +1398,7 @@ app.post("/ai-advice", async (req, res) => {
 
 app.post("/ai-chat", async (req, res) => {
   try {
-    const { messages, currentPlan, allPlans } = req.body || {};
+    const { messages, currentPlan, allPlans, referenceImages = [] } = req.body || {};
 
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "messages array is required" });
@@ -909,19 +1433,39 @@ app.post("/ai-chat", async (req, res) => {
       });
     }
 
-    for (const m of messages) {
+    const latestUserIndex = (() => {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i] && messages[i].role === "user") return i;
+      }
+      return -1;
+    })();
+
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
       if (!m || typeof m !== "object") continue;
       if (m.role === "user" || m.role === "assistant") {
-        contextMessages.push({ role: m.role, content: String(m.content || "") });
+        if (m.role === "user" && i === latestUserIndex) {
+          contextMessages.push({ role: "user", content: buildUserContent(String(m.content || ""), referenceImages) });
+        } else {
+          contextMessages.push({ role: m.role, content: String(m.content || "") });
+        }
       }
     }
 
-    const completion = await client.chat.completions.create({
-      model: process.env.MB_GENAI_MODEL,
-      messages: contextMessages
-    });
-
-    const raw = completion.choices?.[0]?.message?.content || "";
+    let raw;
+    try {
+      raw = await requestModel(contextMessages);
+    } catch (err) {
+      const msg = String(err?.message || "").toLowerCase();
+      const imageLikelyUnsupported = msg.includes("image") || msg.includes("vision") || msg.includes("content") || msg.includes("multimodal");
+      if (!referenceImages.length || !imageLikelyUnsupported) throw err;
+      const textOnlyMessages = contextMessages.map((m) => {
+        if (m.role !== "user" || typeof m.content === "string") return m;
+        const textPart = Array.isArray(m.content) ? m.content.find((p) => p?.type === "text") : null;
+        return { ...m, content: textPart?.text || "" };
+      });
+      raw = await requestModel(textOnlyMessages);
+    }
     const parsed = safeParseAIResponse(raw);
 
     if (!parsed) {
@@ -968,26 +1512,21 @@ app.post("/ai-milestones", async (req, res) => {
       return res.status(400).json({ error: "Invalid plan payload" });
     }
 
-    const completion = await client.chat.completions.create({
-      model: process.env.MB_GENAI_MODEL,
-      messages: [
-        { role: "system", content: MILESTONE_SYSTEM_PROMPT },
-        {
-          role: "user",
-          content:
-            "Today's date is " + new Date().toISOString().slice(0, 10) + ".\n\n" +
-            "Propose an AI-refined milestone plan for this component timing plan. " +
-            "The input plan includes aiSource and milestonesForAI. " +
-            "If aiSource is 'rule', use the rule-based milestone plan as the baseline. " +
-            "If aiSource is 'myPlan', use the engineer's My Plan milestones (milestonesForAI) as the baseline. " +
-            "Use milestonesForAI as the primary baseline for optimisation when present. " +
-            "Return only the JSON object in the required schema. No prose, no markdown.\n\n" +
-            "Plan JSON:\n" + JSON.stringify(plan)
-        }
-      ]
-    });
-
-    const raw = completion.choices?.[0]?.message?.content || "";
+    const raw = await requestModel([
+      { role: "system", content: MILESTONE_SYSTEM_PROMPT },
+      {
+        role: "user",
+        content:
+          "Today's date is " + new Date().toISOString().slice(0, 10) + ".\n\n" +
+          "Propose an AI-refined milestone plan for this component timing plan. " +
+          "The input plan includes aiSource and milestonesForAI. " +
+          "If aiSource is 'rule', use the rule-based milestone plan as the baseline. " +
+          "If aiSource is 'myPlan', use the engineer's My Plan milestones (milestonesForAI) as the baseline. " +
+          "Use milestonesForAI as the primary baseline for optimisation when present. " +
+          "Return only the JSON object in the required schema. No prose, no markdown.\n\n" +
+          "Plan JSON:\n" + JSON.stringify(plan)
+      }
+    ]);
     const parsed = safeParseAIMilestones(raw);
     if (!parsed) {
       console.warn("Unparseable AI milestones output:", raw);
@@ -1007,4 +1546,7 @@ process.on("uncaughtException", (err) => {
 
 app.listen(PORT, () => {
   console.log("CTP AI Backend running on http://localhost:" + PORT);
+  console.log(`[LLM] Provider: ${LLM_PROVIDER}, Model: ${LLM_MODEL}`);
+  const hasKey = LLM_PROVIDER === "openai" ? !!process.env.OPENAI_API_KEY : !!process.env.MB_GENAI_API_KEY;
+  console.log(`[LLM] API key configured: ${hasKey ? "yes" : "NO — extraction will fail!"}`);
 });
