@@ -5,7 +5,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test test/storage-workflow.test.mjs",
+    "test": "node --test test/*.test.mjs",
     "report:shared-templates": "node scripts/report-shared-template-files.mjs"
   },
   "dependencies": {
