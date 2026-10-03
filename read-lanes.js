@@ -24,12 +24,28 @@ function milestoneItems(milestones, source) {
   });
 }
 
+function linkedToolingSpans(milestones, source) {
+  const getDate = (key) => source === "rule"
+    ? milestones?.[key]?.overrideDate || milestones?.[key]?.plannedDate || ""
+    : milestones?.[key]?.plannedDate || "";
+  return [
+    { name: "Proto Tooling", startKey: "protoToolStart", endKey: "protoParts" },
+    { name: "Series Tooling", startKey: "seriesToolStart", endKey: "eswft" }
+  ].flatMap((span) => {
+    const startDate = getDate(span.startKey);
+    const endDate = getDate(span.endKey);
+    return startDate && endDate && endDate >= startDate
+      ? [{ name: span.name, startDate, endDate, type: "duration" }]
+      : [];
+  });
+}
+
 export function buildReadLanes(plan) {
   const lanes = [
     { rowId: "build-plan", name: "Build Plan", items: (plan.builds || []).map((build) => ({ name: build.name || build.label || "Build", startDate: build.start || build.date || "", endDate: build.end || build.endDate || build.start || build.date || "", type: "build" })) },
     { rowId: "rule-plan", name: "BTV Rule Plan", items: milestoneItems(plan.milestones, "rule") },
-    { rowId: "my-plan", name: "My Plan", items: plan.customPlan?.active ? milestoneItems(plan.customPlan.milestones, "custom") : [] },
-    { rowId: "my-plan-2", name: "My Plan 2", items: plan.customPlan2?.active ? milestoneItems(plan.customPlan2.milestones, "custom") : [] },
+    { rowId: "my-plan", name: "My Plan", items: plan.customPlan?.active ? [...milestoneItems(plan.customPlan.milestones, "custom"), ...linkedToolingSpans(plan.customPlan.milestones, "custom")] : [] },
+    { rowId: "my-plan-2", name: "My Plan 2", items: plan.customPlan2?.active ? [...milestoneItems(plan.customPlan2.milestones, "custom"), ...linkedToolingSpans(plan.customPlan2.milestones, "custom")] : [] },
     { rowId: "ai-optimized", name: "AI Optimized", items: plan.aiPlan?.active ? milestoneItems(plan.aiPlan.aiMilestones, "custom") : [] }
   ];
 

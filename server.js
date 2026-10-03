@@ -425,6 +425,37 @@ function buildPlanPath(owner, plan) {
   return path.join(STORAGE_ROOT, "users", safeOwner || "unknown", `${safePlanId}.json`);
 }
 
+function buildWalkthroughStatePath(owner, walkthroughId) {
+  return path.join(STORAGE_ROOT, "users", sanitizeFileName(owner), `.walkthrough-${sanitizeFileName(walkthroughId)}.json`);
+}
+
+async function readWalkthroughState(owner, walkthroughId) {
+  try {
+    return JSON.parse(await fs.readFile(buildWalkthroughStatePath(owner, walkthroughId), "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function writeWalkthroughState(owner, walkthroughId, state) {
+  const statePath = buildWalkthroughStatePath(owner, walkthroughId);
+  const safeState = {
+    walkthroughId: sanitizeFileName(walkthroughId),
+    status: ["not-started", "active", "paused", "completed", "dismissed"].includes(state?.status) ? state.status : "not-started",
+    currentStepId: String(state?.currentStepId || "welcome").slice(0, 120),
+    completedStepIds: Array.isArray(state?.completedStepIds) ? state.completedStepIds.map((id) => String(id).slice(0, 120)).slice(-100) : [],
+    demoPlanId: state?.demoPlanId ? String(state.demoPlanId).slice(0, 200) : null,
+    walkthroughSessionId: state?.walkthroughSessionId ? String(state.walkthroughSessionId).slice(0, 200) : null,
+    startedAt: state?.startedAt || null,
+    lastActiveAt: state?.lastActiveAt || new Date().toISOString(),
+    completedAt: state?.completedAt || null,
+    version: Number(state?.version) || 1
+  };
+  await fs.writeFile(statePath, JSON.stringify(safeState, null, 2), "utf8");
+  return safeState;
+}
+
 function buildJournalRowPath(owner, planId, rowId) {
   return path.join(
     STORAGE_ROOT,
@@ -540,23 +571,23 @@ class JournalRepository {
     }
   }
 
-  async create({ owner, planId, rowId, entryDate, text, attachments, user }) {
+  async create({ owner, planId, rowId, entryDate, text, richText, attachments, user }) {
     return this.withRowWrite(owner, planId, rowId, async () => {
       const { rowPath, entries } = await this.getIndex(owner, planId, rowId);
       const now = new Date().toISOString();
-      const entry = { id: createJournalEntryId(), rowId, entryDate, text, attachments, createdAt: now, updatedAt: now, createdBy: user, updatedBy: user, version: 1 };
+      const entry = { id: createJournalEntryId(), rowId, entryDate, text, richText: String(richText || ""), attachments, createdAt: now, updatedAt: now, createdBy: user, updatedBy: user, version: 1 };
       await writeJsonAtomically(path.join(rowPath, "entries", `${entry.id}.json`), entry);
       await this.writeIndex(rowPath, [...entries, { id: entry.id, entryDate, createdAt: now, updatedAt: now }]);
       return entry;
     });
   }
 
-  async update({ owner, planId, rowId, entryId, entryDate, text, attachments, user }) {
+  async update({ owner, planId, rowId, entryId, entryDate, text, richText, attachments, user }) {
     return this.withRowWrite(owner, planId, rowId, async () => {
       const { rowPath, entries } = await this.getIndex(owner, planId, rowId);
       const existing = await this.getEntry(rowPath, entryId);
       if (!existing) return null;
-      const updated = { ...existing, entryDate, text, attachments, updatedAt: new Date().toISOString(), updatedBy: user, version: Number(existing.version || 1) + 1 };
+      const updated = { ...existing, entryDate, text, richText: String(richText || ""), attachments, updatedAt: new Date().toISOString(), updatedBy: user, version: Number(existing.version || 1) + 1 };
       await writeJsonAtomically(path.join(rowPath, "entries", `${sanitizeFileName(entryId)}.json`), updated);
       await this.writeIndex(rowPath, entries.map((entry) => entry.id === entryId ? { ...entry, entryDate, updatedAt: updated.updatedAt } : entry));
       return updated;
@@ -763,7 +794,43 @@ app.post("/api/session", async (req, res) => {
   }
 });
 
-app.use(["/api/plans", "/api/storage"], requireCurrentUser);
+app.use(["/api/plans", "/api/storage", "/api/walkthrough"], requireCurrentUser);
+
+app.get("/api/walkthrough/:walkthroughId", async (req, res) => {
+  try {
+    const state = await readWalkthroughState(req.currentUser, req.params.walkthroughId);
+    res.json({ ok: true, state });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: describeStorageError(error) });
+  }
+});
+
+app.put("/api/walkthrough/:walkthroughId", async (req, res) => {
+  try {
+    const state = await writeWalkthroughState(req.currentUser, req.params.walkthroughId, req.body || {});
+    res.json({ ok: true, state });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: describeStorageError(error) });
+  }
+});
+
+app.delete("/api/walkthrough/:walkthroughId/demo/:planId", async (req, res) => {
+  try {
+    const state = await readWalkthroughState(req.currentUser, req.params.walkthroughId);
+    const plan = await findPlanByIdOrFileId(req.params.planId, req.currentUser);
+    if (!state || !plan || state.demoPlanId !== String(plan.planId || plan.id) || !plan.isWalkthroughDemo || normalizeUserName(plan.owner) !== req.currentUser || !plan.walkthroughSessionId || plan.walkthroughSessionId !== state.walkthroughSessionId) {
+      return res.status(403).json({ ok: false, error: "This plan is not the active walkthrough demo for the authenticated user." });
+    }
+    await fs.unlink(plan._filePath || buildPlanPath(req.currentUser, plan));
+    await fs.unlink(buildActualsPath(req.currentUser, plan.planId || plan.id)).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await fs.rm(path.dirname(buildJournalRowPath(req.currentUser, plan.planId || plan.id, "placeholder")), { recursive: true, force: true });
+    await writeWalkthroughState(req.currentUser, req.params.walkthroughId, { ...state, status: "completed", demoPlanId: null });
+    res.json({ ok: true, deleted: true, id: req.params.planId });
+  } catch (error) {
+    console.error("Walkthrough demo cleanup error:", error);
+    res.status(500).json({ ok: false, error: describeStorageError(error) });
+  }
+});
 
 app.get("/api/plans/my", async (req, res) => {
   const currentUser = req.currentUser;
@@ -824,10 +891,12 @@ app.get("/api/storage/status", async (req, res) => {
 function validateJournalInput(body) {
   const entryDate = String(body?.entryDate || "").trim();
   const text = String(body?.text || "").trim();
+  const richText = typeof body?.richText === "string" ? body.richText.trim() : "";
   const attachments = Array.isArray(body?.attachments) ? body.attachments : [];
   if (!isDateOnly(entryDate)) return { error: "A valid journal date is required." };
   if (!text) return { error: "Journal text cannot be empty." };
   if (text.length > 30000) return { error: "A journal entry cannot exceed 30,000 characters." };
+  if (richText.length > 120000) return { error: "Rich text content is too large." };
   if (attachments.length > 5) return { error: "A journal entry can have up to five attachments." };
   const supportedAttachmentTypes = "image/(png|jpeg|gif|webp)|application/pdf|application/msword|application/vnd\\.openxmlformats-officedocument\\.wordprocessingml\\.document|application/vnd\\.ms-powerpoint|application/vnd\\.openxmlformats-officedocument\\.presentationml\\.presentation";
   const normalizedAttachments = [];
@@ -837,7 +906,7 @@ function validateJournalInput(body) {
     if (dataUrl.length > 4 * 1024 * 1024) return { error: "Each attachment must be 3 MB or smaller." };
     normalizedAttachments.push({ id: sanitizeFileName(attachment?.id || createJournalEntryId()), name: String(attachment?.name || "attachment").slice(0, 160), type: String(attachment?.type || "application/octet-stream").slice(0, 120), dataUrl });
   }
-  return { entryDate, text, attachments: normalizedAttachments };
+  return { entryDate, text, richText, attachments: normalizedAttachments };
 }
 
 function journalRequestOptions(query) {
@@ -947,6 +1016,37 @@ app.delete("/api/plans/:planId/rows/:rowId/journal/:entryId", async (req, res) =
   }
 });
 
+app.post("/api/journal/enhance", requireCurrentUser, async (req, res) => {
+  try {
+    const text = String(req.body?.text || "").trim();
+    if (!text) return res.status(400).json({ ok: false, error: "Text is required." });
+    if (text.length > 30000) return res.status(400).json({ ok: false, error: "Text cannot exceed 30,000 characters." });
+
+    const enhanced = String(await requestModel([
+      {
+        role: "system",
+        content: [
+          "You are an internal writing assistant for protocol and MOM entries.",
+          "Rewrite the user's text with correct grammar, clearer phrasing, and professional tone.",
+          "Preserve factual meaning, dates, decisions, and action points.",
+          "Do not add new facts. Do not use markdown or bullet symbols unless already present.",
+          "Return only the revised text."
+        ].join(" ")
+      },
+      {
+        role: "user",
+        content: text
+      }
+    ]) || "").trim();
+
+    if (!enhanced) return res.status(502).json({ ok: false, error: "AI did not return enhanced text." });
+    return res.json({ ok: true, text: enhanced.slice(0, 30000) });
+  } catch (error) {
+    console.error("Enhance journal text error:", error);
+    return res.status(500).json({ ok: false, error: error.message || "Could not enhance journal text." });
+  }
+});
+
 app.get("/api/plans/:planId/actuals", async (req, res) => {
   try {
     const plan = await requireOwnedJournalPlan(req, res);
@@ -1053,17 +1153,26 @@ app.post("/api/plans/copy", async (req, res) => {
     while (await fs.access(buildPlanPath(currentUser, { planId: copyId })).then(() => true).catch(() => false)) {
       copyId = `${requestedName}_${suffix++}`;
     }
+    // Copy only the baseline Build Plan content so the recipient starts with a clean editable plan.
     const copiedPlan = ensureMetadata({
-      ...sourcePlan,
+      planId: copyId,
+      id: copyId,
       owner: currentUser,
       carline: String(carline || sourcePlan.carline || "").trim(),
       commodity: String(commodity || sourcePlan.commodity || "").trim(),
+      supplier: String(sourcePlan.supplier || "").trim(),
+      builds: Array.isArray(sourcePlan.builds) ? sourcePlan.builds : [],
+      milestones: sourcePlan.milestones && typeof sourcePlan.milestones === "object" ? sourcePlan.milestones : {},
+      componentInfo: sourcePlan.componentInfo && typeof sourcePlan.componentInfo === "object"
+        ? sourcePlan.componentInfo
+        : { partNumber: "", supplierName: "", drawingNumber: "", notes: "" },
+      // Ensure copied shared plans never remain read-only for the recipient.
+      sharedFolder: false,
+      readOnly: false,
       createdBy: currentUser,
       lastModifiedBy: currentUser,
       createdDate: new Date().toISOString(),
       lastModifiedDate: new Date().toISOString(),
-      planId: copyId,
-      id: copyId,
       copiedFromOwner,
       copiedFromPlanId: String(sourcePlan.planId || sourcePlan.id || planId)
     }, currentUser);
@@ -1101,7 +1210,7 @@ app.delete("/api/plans/:id", async (req, res) => {
 // Structured Senior BTV Planner Advisor Prompt (Step 6.2.d)
 // ─────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = [
-  "You are the AI Planning Advisor inside the BTV AI Planner tool, internally identified as Mission 865.",
+  "You are the AI Planning Advisor inside the BTV Planning Agent tool.",
   "You act as a senior BTV component timing planner at Mercedes-AMG in the AMG Chassis Team,",
   "with over 20 years of experience in component development planning, tooling risk analysis,",
   "sampling strategy, PPAP readiness, and supplier maturity assessment.",
@@ -1370,7 +1479,7 @@ async function executeReadTool({ owner, tool, args, plans, timeZone }) {
     if (laneResolution.status !== "resolved") return finish(resolverFailure(laneResolution));
     const row = lanes.find((lane) => lane.rowId === laneResolution.value);
     const journal = await journalRepository.list({ owner: plan.owner || owner, planId: plan.planId || plan.id, rowId: row.rowId, page: 1, pageSize: Math.min(Number(filter.limit) || 20, 50), search: filter.search || "", fromDate: filter.fromDate || "", toDate: filter.toDate || "" });
-    result = { ok: true, lane: row.name, total: journal.total, entries: journal.items.map((entry) => ({ entryDate: entry.entryDate, text: entry.text, attachments: (entry.attachments || []).map((attachment) => ({ name: attachment.name, type: attachment.type })) })) };
+    result = { ok: true, lane: row.name, total: journal.total, entries: journal.items.map((entry) => ({ entryDate: entry.entryDate, text: entry.text, richText: entry.richText || "", attachments: (entry.attachments || []).map((attachment) => ({ name: attachment.name, type: attachment.type })) })) };
   } else if (tool === "getDelaySummary") {
     result = { ok: true, summary: await getDelaySummaryForPlan(plan.owner || owner, plan, lanes, timeZone) };
   } else result = { ok: false, status: "rejected", message: "Unsupported read-only tool." };
@@ -1386,6 +1495,10 @@ function addDays(value, days) {
 
 function describeResolvedItem(plan, item) {
   if (item.kind === "readOnlyItem") return item;
+  if (item.kind === "linkedMilestoneSpan") {
+    const dates = getPlanItemDates(plan, item);
+    return dates ? { ...item, ...dates, native: null } : null;
+  }
   if (item.kind === "customMilestone") {
     const milestone = plan?.[item.customPlanField]?.milestones?.[item.milestoneKey];
     if (!milestone?.plannedDate) return null;
@@ -1740,7 +1853,7 @@ const READ_ONLY_CHAT_SYSTEM_PROMPT = [
 // Concierge Chat Prompt (Step 6.3.d)
 // ─────────────────────────────────────────────────────────────
 const CHAT_SYSTEM_PROMPT = [
-  "You are the AI concierge inside the BTV AI Planner tool, internally identified as Mission 865.",
+  "You are the AI concierge inside the BTV Planning Agent tool.",
   "You act as a senior BTV component timing planner assistant at Mercedes-AMG.",
   "You have over 20 years of experience in component development planning, tooling risk,",
   "sampling strategy, PPAP readiness, and supplier maturity.",
@@ -1800,7 +1913,7 @@ const CHAT_SYSTEM_PROMPT = [
 
 const MILESTONE_SYSTEM_PROMPT = [
   "You are a senior BTV component timing planner at Mercedes-AMG in the AMG Chassis Team.",
-  "You are the AI Optimizer inside the BTV AI Planner tool, internally identified as Mission 865.",
+  "You are the AI Optimizer inside the BTV Planning Agent tool.",
   "",
   "You will be given a BTV component development plan as JSON in the user message.",
   "Your task is to propose a REFINED milestone plan that respects real-world engineering constraints.",

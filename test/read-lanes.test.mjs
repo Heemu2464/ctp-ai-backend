@@ -51,6 +51,22 @@ test("includes range and milestone boundary dates while excluding disjoint items
   assert.ok(query("2026-10-26", "2026-10-26").items.some((item) => item.name === "At window end"));
 });
 
+test("includes derived tooling spans in My Plan read results", () => {
+  const toolingPlan = {
+    ...plan,
+    customPlan: {
+      active: true,
+      milestones: {
+        protoToolStart: { name: "Proto Tool Start", plannedDate: "2027-02-08" },
+        protoParts: { name: "Proto Parts", plannedDate: "2027-04-19" }
+      }
+    }
+  };
+  const result = queryReadItems(buildReadLanes(toolingPlan), { search: "proto tooling", fromDate: "2027-02-01", toDate: "2027-04-30" });
+
+  assert.deepEqual(result.items, [{ name: "Proto Tooling", startDate: "2027-02-08", endDate: "2027-04-19", type: "duration", lane: "My Plan" }]);
+});
+
 test("returns the nearest real item when a date window has no results", () => {
   const result = queryReadItems(lanes, { search: "after", fromDate: "2026-10-20", toDate: "2026-10-25" });
 
