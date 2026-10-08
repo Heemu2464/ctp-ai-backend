@@ -13,6 +13,7 @@ import { createPlanResolverContext, resolveItem, resolveLane, resolvePlan } from
 import { analyzeCriticalPathImpact, analyzeDownstreamImpact, analyzeScheduleConflicts, buildCascadeProposal, calculateCriticalPath, getAllAncestors, getAllDescendants, getItemById, getItemDependencyMetrics, getPredecessors, getSuccessors } from "../../timing-planner/src/dependencyService.js";
 import { generateRecoveryScenarios, getRecoveryReferences, validateRecoveryScenario } from "../../timing-planner/src/recoveryService.js";
 import { buildReadLanes, queryOpenAndOverduePlanItems, queryReadItems } from "./read-lanes.js";
+import { analyzeBuildImpact, describeBuildImpact, findPlanItemMention } from "../../timing-planner/src/buildImpact.js";
 import { createLocalAuthRouter } from "./auth/localRoutes.js";
 import { createUserRepository, LOCAL_IDENTITY_SOURCE, normalizeShortId } from "./auth/localAuth.js";
 import { createRequireAuth, requireAdmin } from "./auth/localMiddleware.js";
@@ -1333,6 +1334,69 @@ function publicPlanName(plan) {
   return [plan?.carline, plan?.commodity].filter(Boolean).join(" - ") || "Plan";
 }
 
+function findMentionedPlans(text, plans) {
+  const compact = (value) => String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const query = compact(text);
+  const byCarline = plans.filter((plan) => compact(plan.carline).length >= 3 && query.includes(compact(plan.carline)));
+  const byCommodity = byCarline.filter((plan) => compact(plan.commodity) && query.includes(compact(plan.commodity)));
+  return byCommodity.length ? byCommodity : byCarline;
+}
+
+function parseOpenPlanRequest(text, plans) {
+  const text_ = String(text || "");
+  const match = /^\s*(?:please\s+)?(?:open|go to|switch to|take me to)\s+(?:the\s+)?(.+?)\s*[.!?]?\s*$/i.exec(text_)
+    || /^\s*(?:please\s+)?(?:show me|view)\s+(?:the\s+)?(.+?\bplan)\s*[.!?]?\s*$/i.exec(text_);
+  if (!match) return null;
+  const candidates = findMentionedPlans(match[1].replace(/\bplans?\b/gi, ""), plans);
+  if (!candidates.length) return null;
+  return candidates.length === 1 ? { plan: candidates[0] } : { candidates };
+}
+
+// Plan a conversation is about: the open plan, unless the user names a different carline.
+function resolveConversationPlan(text, selectedPlan, plans) {
+  const mentioned = findMentionedPlans(text, plans);
+  if (selectedPlan && (!mentioned.length || mentioned.some((plan) => plan === selectedPlan))) return { plan: selectedPlan, switched: false };
+  if (mentioned.length === 1) return { plan: mentioned[0], switched: Boolean(selectedPlan) };
+  if (mentioned.length > 1 && selectedPlan) {
+    const sameCarline = mentioned.filter((plan) => String(plan.carline).toLowerCase() === String(selectedPlan.carline).toLowerCase());
+    if (sameCarline.length === mentioned.length) return { plan: selectedPlan, switched: false };
+  }
+  return mentioned.length ? { candidates: mentioned } : { plan: selectedPlan || null, switched: false };
+}
+
+function parseShiftQuestion(text, timeZone) {
+  const input = String(text || "").trim();
+  if (/critical path|recover/i.test(input)) return null;
+  const asksImpact = /\b(?:what happens|what will happen|what if|impact|effect|consequence|affect|can (?:i|we)|if (?:i|we)|is it ok|is it possible|meet|still)\b/i.test(input);
+  const mentionsMove = /\b(?:move[sd]?|moving|shift(?:s|ed|ing)?|delay(?:s|ed)?|slip(?:s|ped)?|postpone[sd]?|push(?:ed)?|pull(?:ed)?\s+in|bring forward|prepone|advance|later|earlier)\b/i.test(input);
+  if (!asksImpact || !mentionsMove) return null;
+  const dateMatch = /\b(?:to|on|until)\s+(\d{4}-\d{2}-\d{2}|\d{1,2}\s+[a-z]+(?:\s+\d{4})?)/i.exec(input);
+  const targetDate = dateMatch ? parseConversationDate(dateMatch[1], timeZone) : "";
+  const amount = /(\d+)\s*(days?|weeks?|wks?|months?)\b/i.exec(input);
+  let deltaDays = amount ? Number(amount[1]) * (/^w/i.test(amount[2]) ? 7 : /^m/i.test(amount[2]) ? 30 : 1) : 0;
+  if (/\b(?:earlier|pull(?:ed)?\s+in|bring forward|forward|prepone|advance)\b/i.test(input)) deltaDays = -deltaDays;
+  return { targetDate, deltaDays };
+}
+
+function buildImpactReply(plan, mention, shift) {
+  const proposedDate = shift.targetDate || (shift.deltaDays ? addDays(mention.primary.date, shift.deltaDays) : "");
+  const lines = [`For ${publicPlanName(plan)}:`, describeBuildImpact(analyzeBuildImpact(plan, mention.primary, proposedDate))];
+  if (mention.others.length) lines.push(`(Using ${mention.primary.laneName}. Also in: ${mention.others.map((item) => `${item.laneName} on ${item.date}`).join("; ")}. Name the lane to check another one.)`);
+  if (!proposedDate) lines.push("Tell me how far to move it, for example \"by 2 weeks\" or \"to 2027-08-01\", and I will check the build impact of that shift.");
+  return lines.join("\n");
+}
+
+function proposalBuildImpactNote(plan, proposal) {
+  const preview = proposal?.preview;
+  if (!plan || !preview) return "";
+  const change = preview.kind === "update" && preview.result?.startDate && preview.result.startDate !== preview.item?.startDate
+    ? { item: preview.item, before: preview.item.startDate, after: preview.result.startDate }
+    : preview.kind === "shift" && preview.changes?.length === 1 ? preview.changes[0] : null;
+  if (!change?.before || !change?.after) return "";
+  const item = { name: change.item.name, key: change.item.milestoneKey || "", laneName: proposal.laneName || "", date: change.before };
+  return `\n\nBuild impact:\n${describeBuildImpact(analyzeBuildImpact(plan, item, change.after))}`;
+}
+
 function safeTimeZone(value) {
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: value });
@@ -1500,8 +1564,9 @@ async function executeReadTool({ owner, tool, args, plans, timeZone }) {
   };
   if (tool === "queryAcrossPlans") return finish(await queryOpenAndOverdueAcrossPlans(owner, plans, args.filter || {}, timeZone));
   const planResolution = resolvePlan(args.planId, plans);
-  if (planResolution.status !== "resolved") return finish(resolverFailure(planResolution));
-  const plan = plans.find((candidate) => String(candidate.planId || candidate.id) === String(planResolution.value));
+  const scopedSinglePlan = planResolution.status !== "resolved" && plans.length === 1 ? plans[0] : null;
+  if (planResolution.status !== "resolved" && !scopedSinglePlan) return finish(resolverFailure(planResolution));
+  const plan = scopedSinglePlan || plans.find((candidate) => String(candidate.planId || candidate.id) === String(planResolution.value));
   if (!plan) return finish({ ok: false, status: "not_found", message: "I could not find that plan." });
   const lanes = buildReadLanes(plan);
   const laneContext = { lanes: lanes.map((lane) => ({ id: lane.rowId, name: lane.name })) };
@@ -1606,8 +1671,8 @@ function parseTimelineEditIntent(text, timeZone) {
   match = /^(?:mark|set)\s+(.+?)\s+(?:as\s+)?complete(?:d)?$/i.exec(input);
   if (match) return { action: "markComplete", intentType: "MARK_COMPLETE", args: { item: match[1].trim(), actualCompletionDate: localDateOnly(timeZone) } };
 
-  match = /^(?:move|shift)\s+(.+?)\s+by\s+(-?\d+)\s+(day|days|week|weeks)$/i.exec(input);
-  if (match) return { action: "shiftItems", intentType: "EDIT_DATE", args: { items: match[1].trim(), deltaDays: Number(match[2]) * (/^week/i.test(match[3]) ? 7 : 1) } };
+  match = /^(?:move|shift|delay|push)\s+(?:the\s+)?(.+?)\s+(?:by\s+)?(-?\d+)\s*(d|days?|w|wks?|weeks?)(?:\s+(later|earlier))?$/i.exec(input);
+  if (match) return { action: "shiftItems", intentType: "EDIT_DATE", args: { items: match[1].trim(), deltaDays: Number(match[2]) * (/^w/i.test(match[3]) ? 7 : 1) * (/earlier/i.test(match[4] || "") ? -1 : 1) } };
 
   match = /^(?:move|shift)\s+(.+?)\s+(?:to|on)\s+(\d{4}-\d{2}-\d{2}|\d{1,2}\s+[a-z]+(?:\s+\d{4})?)$/i.exec(input);
   if (match) {
@@ -2610,6 +2675,14 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
     if (!availablePlans.length) {
       return res.json({ ok: true, reply: "I could not find any plans in your workspace yet.", intent: { type: "none", targetCarline: "", targetCommodity: "" } });
     }
+    const openRequest = parseOpenPlanRequest(latestUserText, availablePlans);
+    if (openRequest?.plan) {
+      const target = openRequest.plan;
+      return res.json({ ok: true, reply: `Opening ${publicPlanName(target)}.`, intent: { type: "open_plan", targetCarline: target.carline || "", targetCommodity: target.commodity || "", targetPlanId: String(target.planId || target.id) } });
+    }
+    if (openRequest?.candidates) {
+      return res.json({ ok: true, reply: `I found ${openRequest.candidates.length} matching plans: ${openRequest.candidates.map((plan) => publicPlanName(plan)).join("; ")}. Which one should I open?`, intent: { type: "none", targetCarline: "", targetCommodity: "" } });
+    }
     if (selection.status === "not_found") {
       return res.json({ ok: true, reply: `I found ${selection.planCount} plans but couldn't identify the selected one. Available plans: ${selection.candidates.map((candidate) => candidate.name).join("; ")}.`, intent: { type: "none", targetCarline: "", targetCommodity: "" } });
     }
@@ -2619,6 +2692,17 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
     if (selection.status === "ambiguous") {
       return res.json({ ok: true, reply: `I found ${selection.planCount} plans, but the selected plan is ambiguous. Which one do you mean: ${selection.candidates.map((candidate) => candidate.name).join("; ")}?`, intent: { type: "none", targetCarline: "", targetCommodity: "" } });
     }
+    const shiftQuestion = parseShiftQuestion(latestUserText, timeZone);
+    if (shiftQuestion) {
+      const scope = resolveConversationPlan(latestUserText, selection.plan || null, availablePlans);
+      if (scope.candidates) {
+        return res.json({ ok: true, reply: `Which plan do you mean: ${scope.candidates.map((plan) => publicPlanName(plan)).join("; ")}?`, intent: { type: "none", targetCarline: "", targetCommodity: "" } });
+      }
+      const mention = scope.plan ? findPlanItemMention(scope.plan, latestUserText) : null;
+      if (mention) {
+        return res.json({ ok: true, reply: buildImpactReply(scope.plan, mention, shiftQuestion), intent: { type: "none", targetCarline: "", targetCommodity: "" } });
+      }
+    }
     const directEdit = parseTimelineEditIntent(latestUserText, timeZone);
     const dependencyIntent = parseDependencyIntent(latestUserText, timeZone);
     const recoveryIntent = parseRecoveryIntent(latestUserText);
@@ -2626,6 +2710,10 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
       return res.json({ ok: true, reply: `I found ${selection.planCount} plans. Select one to ask timeline or MOM questions: ${availablePlans.map((plan) => publicPlanName(plan)).join("; ")}.`, intent: { type: "none", targetCarline: "", targetCommodity: "" } });
     }
     const selectedStoredPlan = selection.plan || null;
+    const conversationScope = resolveConversationPlan(latestUserText, selectedStoredPlan, availablePlans);
+    const asksAllPlans = /\b(?:all|every|across|other)\s+(?:of\s+)?(?:my\s+|the\s+)?(?:plans|carlines|projects|programs)\b/i.test(latestUserText);
+    const focusPlan = conversationScope.plan || selectedStoredPlan;
+    const scopedPlans = asksAllPlans ? availablePlans : focusPlan ? [focusPlan] : conversationScope.candidates || availablePlans;
 
     if (recoverySession && selectedStoredPlan && /^(?:cancel(?:\s+it|\s+recovery)?|clear recovery)$/i.test(String(latestUserText || "").trim())) {
       return res.json({ ok: true, reply: "Recovery cancelled. No planning data changed.", intent: { type: "none", targetCarline: "", targetCommodity: "" }, recoveryAction: { type: "cancel" } });
@@ -2813,7 +2901,7 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
     if (directEdit) {
       const rawTarget = directEdit.args.item || directEdit.args.items || "";
       const currentCandidates = selectedStoredPlan ? findEditCandidates([selectedStoredPlan], rawTarget, visibleLanes) : [];
-      const candidates = currentCandidates.length ? currentCandidates : findEditCandidates(availablePlans, rawTarget, visibleLanes);
+      const candidates = currentCandidates.length ? currentCandidates : findEditCandidates(scopedPlans, rawTarget, visibleLanes);
       if (candidates.length > 1) {
         const pending = pendingActionResponse({ originalMessage: latestUserText, edit: directEdit, candidates });
         const question = pending.currentClarificationField === "carline"
@@ -2853,17 +2941,17 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
           } : { ...pendingActionResponse({ originalMessage: latestUserText, edit: directEdit, candidates: [candidate], selectedCandidate: candidate }), status: "ready_for_confirmation", missingFields: [], currentClarificationField: "" };
-          return res.json({ ok: true, reply: `I found ${candidate.itemName} in the ${candidate.carline} plan, ${candidate.laneName}.${impactMessage} ${hasConflict ? "Choose how to handle the downstream items." : "Please confirm the proposed change."}`, intent: { type: "none", targetCarline: "", targetCommodity: "" }, writeProposal: proposal, dependencyAnalysis, pendingAgentAction: pendingAction });
+          return res.json({ ok: true, reply: `I found ${candidate.itemName} in the ${candidate.carline} plan, ${candidate.laneName}.${impactMessage} ${hasConflict ? "Choose how to handle the downstream items." : "Please confirm the proposed change."}${proposalBuildImpactNote(targetPlan, proposal)}`, intent: { type: "none", targetCarline: "", targetCommodity: "" }, writeProposal: proposal, dependencyAnalysis, pendingAgentAction: pendingAction });
         }
       }
     }
-    const compactContext = selectedStoredPlan
+    const compactContext = focusPlan
       ? await (async () => {
-          const lanes = buildReadLanes(selectedStoredPlan);
-          const planOwner = selectedStoredPlan.owner || req.currentUser;
-          const delaySummary = await getDelaySummaryForPlan(planOwner, selectedStoredPlan, lanes, timeZone);
-          const journalCounts = await getJournalCounts(planOwner, selectedStoredPlan.planId || selectedStoredPlan.id, lanes);
-          return createReadContext(selectedStoredPlan, visibleLanes, timeZone, delaySummary, journalCounts);
+          const lanes = buildReadLanes(focusPlan);
+          const planOwner = focusPlan.owner || req.currentUser;
+          const delaySummary = await getDelaySummaryForPlan(planOwner, focusPlan, lanes, timeZone);
+          const journalCounts = await getJournalCounts(planOwner, focusPlan.planId || focusPlan.id, lanes);
+          return createReadContext(focusPlan, visibleLanes, timeZone, delaySummary, journalCounts);
         })()
       : null;
 
@@ -2879,6 +2967,11 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
         "Use public plan and lane names in tool arguments. Never use or request internal IDs.",
         "For ambiguous or unknown tool results, ask a concise clarifying question. updateItem, shiftItems, deleteItem, and markComplete may be proposed for editable items; they require frontend confirmation before execution.",
         "Return the existing JSON reply/intent object after tools finish. Keep intent.type as none for read-only chat.",
+        ...(focusPlan && !asksAllPlans ? [
+          `Current plan: ${publicPlanName(focusPlan)}. Every question is about this plan unless the engineer names another carline. Never answer with items from other plans and never say there are several matches across plans.`,
+          "If a milestone exists in several lanes of this plan, answer for the Final Plan lane (else My Plan, else the BTV Rule Plan) and mention the other lanes briefly.",
+          "Every milestone, My Plan, AI Optimized Plan and sub-activity date is judged against the vehicle Build Plan: say which build it serves and whether it still meets that build."
+        ] : []),
         "Compact selected-plan context: " + JSON.stringify(compactContext || { selectedPlan: null, availablePlans: availablePlans.map((plan) => publicPlanName(plan)), today: localDateOnly(timeZone), timeZone })
       ].join("\n")
     });
@@ -2915,7 +3008,7 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
           : "";
       const reply = conversationalEdit.intentType === "DELETE_ITEM"
         ? `I found ${target} in ${resolvedItem?.carline || selectedStoredPlan.carline}.${visibilityNotice} Are you sure you want to delete it?`
-        : `I found ${target} in ${resolvedItem?.carline || selectedStoredPlan.carline}.${visibilityNotice} Please confirm the proposed change.`;
+        : `I found ${target} in ${resolvedItem?.carline || selectedStoredPlan.carline}.${visibilityNotice} Please confirm the proposed change.${proposalBuildImpactNote(selectedStoredPlan, proposal)}`;
       return res.json({ ok: true, reply, intent: { type: "none", targetCarline: "", targetCommodity: "" }, writeProposal: proposal });
     }
 
@@ -2955,7 +3048,7 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
               writeProposal = proposal;
               result = { ok: true, requiresConfirmation: true, proposal };
             }
-          } else result = await executeReadTool({ owner: req.currentUser, tool, args, plans: availablePlans, timeZone });
+          } else result = await executeReadTool({ owner: req.currentUser, tool, args, plans: scopedPlans, timeZone });
           if (result.ok === false && !["ambiguous", "not_found", "rejected"].includes(result.status)) await auditReadToolCall(req.currentUser, tool || "unknown", args, result);
           contextMessages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
         }

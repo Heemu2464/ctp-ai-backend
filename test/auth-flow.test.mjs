@@ -202,6 +202,40 @@ test("plans marked UNASSIGNED before registration are reclaimed by the matching 
   }
 });
 
+test("chat open-plan requests resolve carline and commodity to the exact plan", async () => {
+  const cookie = await server.login("owneraa");
+  const base = { builds: [], milestones: {}, subActivities: [], customPlan: { active: false }, customPlan2: { active: false }, aiPlan: { active: false } };
+  for (const [planId, commodity] of [["x192-halter", "Plastic Halter_Bremsschlauch"], ["x192-hose", "Brake Hose"]]) {
+    assert.equal((await server.call("/api/plans/save", { method: "POST", cookie, body: { ...base, planId, id: planId, owner: "owneraa", carline: "X192", commodity } })).status, 200);
+  }
+  const chat = (content) => server.call("/ai-chat", { method: "POST", cookie, body: { messages: [{ role: "user", content }] } });
+  const opened = await chat("open x192 brakehose plan");
+  assert.equal(opened.json.intent.type, "open_plan");
+  assert.equal(opened.json.intent.targetPlanId, "x192-hose");
+  const ambiguous = await chat("open x192");
+  assert.equal(ambiguous.json.intent.type, "none");
+  assert.match(ambiguous.json.reply, /Which one should I open/);
+});
+
+test("what-if shift questions stay on the open plan and report build impact", async () => {
+  const cookie = await server.login("owneraa");
+  const base = { subActivities: [], customPlan: { active: false }, customPlan2: { active: false }, aiPlan: { active: false } };
+  const withBlank = (planId, carline, date) => ({ ...base, planId, id: planId, owner: "owneraa", carline, commodity: "Brake Hose", builds: [{ id: "p", name: "Pro-Build", type: "pro", start: "2027-10-04" }], milestones: { blankRelease: { key: "blankRelease", name: "Blank Release", plannedDate: date } } });
+  for (const plan of [withBlank("w465-hose", "W465", "2027-07-05"), withBlank("v267-hose", "V267", "2027-06-01")]) {
+    assert.equal((await server.call("/api/plans/save", { method: "POST", cookie, body: plan })).status, 200);
+  }
+  const ask = (content, selectedPlanRef = "w465-hose") => server.call("/ai-chat", { method: "POST", cookie, body: { selectedPlanRef, messages: [{ role: "user", content }] } });
+  const scoped = await ask("what happens if I move the blank release by 4 weeks?");
+  assert.match(scoped.json.reply, /W465 - Brake Hose/);
+  assert.match(scoped.json.reply, /2027-07-05 to 2027-08-02/);
+  assert.match(scoped.json.reply, /Pro-Build is at risk/);
+  assert.doesNotMatch(scoped.json.reply, /V267/);
+  const buffer = await ask("can I delay the blank release?");
+  assert.match(buffer.json.reply, /can slip up to 3 weeks \(until 2027-07-26\)/);
+  const switched = await ask("what if V267 blank release slips 1 week");
+  assert.match(switched.json.reply, /V267 - Brake Hose/);
+});
+
 test("separate auth storage keeps registration credentials out of plan storage", async () => {
   const isolated = await startTestServer({ separateAuthStorage: true, users: [mockUser("splitaa")] });
   try {
