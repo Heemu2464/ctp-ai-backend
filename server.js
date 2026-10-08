@@ -55,6 +55,8 @@ app.use(cors({
 app.use(express.json({ limit: "50mb" }));
 const SESSION_COOKIE_NAME = "btv.sid";
 const sessionCookieOptions = { path: "/", httpOnly: true, sameSite: "lax", secure: String(process.env.COOKIE_SECURE || "false").toLowerCase() === "true" };
+const REMEMBER_ME_MAX_AGE_MS = Math.max(60 * 60 * 1000, Number(process.env.REMEMBER_ME_MAX_AGE_MS || 30 * 24 * 60 * 60 * 1000));
+app.locals.rememberMeMaxAgeMs = REMEMBER_ME_MAX_AGE_MS;
 // Default MemoryStore: single server instance assumed; sessions end when the server restarts.
 app.use(session({
   name: SESSION_COOKIE_NAME,
@@ -67,9 +69,13 @@ app.use(session({
 app.use((req, res, next) => {
   const auth = req.session?.auth;
   if (!auth) return next();
+  if (!auth.rememberMe) {
+    auth.lastSeenAt = Date.now();
+    return next();
+  }
   const now = Date.now();
-  const absoluteMs = Math.max(10 * 60 * 1000, Number(process.env.SESSION_ABSOLUTE_MS || 24 * 60 * 60 * 1000));
-  const idleMs = Math.max(5 * 60 * 1000, Number(process.env.SESSION_IDLE_MS || 8 * 60 * 60 * 1000));
+  const absoluteMs = Math.max(10 * 60 * 1000, Number(process.env.REMEMBER_ME_ABSOLUTE_MS || 30 * 24 * 60 * 60 * 1000));
+  const idleMs = Math.max(5 * 60 * 1000, Number(process.env.REMEMBER_ME_IDLE_MS || 7 * 24 * 60 * 60 * 1000));
   if (now - auth.loginAt > absoluteMs || now - auth.lastSeenAt > idleMs) {
     return req.session.regenerate((error) => next(error));
   }

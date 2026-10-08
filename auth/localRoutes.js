@@ -27,7 +27,7 @@ export function createLocalAuthRouter({ users, cookieName, storageRoot }) {
   });
 
   router.post("/login", async (req, res) => {
-    const { identifier = "", password = "" } = req.body || {};
+    const { identifier = "", password = "", rememberMe = false } = req.body || {};
     const result = await users.authenticate({ identifier, password });
     if (!result.ok) {
       const status = result.code === "LOCKED" ? 429 : result.code === "NOT_APPROVED" ? 403 : 401;
@@ -46,9 +46,18 @@ export function createLocalAuthRouter({ users, cookieName, storageRoot }) {
         email: safe.email,
         role: safe.role,
         credentialVersion: result.user.credentialVersion,
+        rememberMe: Boolean(rememberMe),
         loginAt: Date.now(),
         lastSeenAt: Date.now()
       };
+      if (req.session.cookie) {
+        if (Boolean(rememberMe)) {
+          req.session.cookie.maxAge = req.app.locals.rememberMeMaxAgeMs;
+        } else {
+          req.session.cookie.expires = false;
+          req.session.cookie.maxAge = null;
+        }
+      }
       return res.json(authResponse(safe));
     });
   });
