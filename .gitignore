@@ -3,7 +3,16 @@ node_modules/
 .env.*
 !.env.example
 server.log
+logs/
 dist/
 build/
 .vite/
 npm-debug.log*
+auth/users.json
+auth/users.json.*
+private-data/
+**/auth/users.json
+**/auth/users.json.*
+BTV_PLANNER/
+**/captured-mail*.jsonl
+dev/mock-directory.json

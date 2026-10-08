@@ -13,13 +13,23 @@ import { createPlanResolverContext, resolveItem, resolveLane, resolvePlan } from
 import { analyzeCriticalPathImpact, analyzeDownstreamImpact, analyzeScheduleConflicts, buildCascadeProposal, calculateCriticalPath, getAllAncestors, getAllDescendants, getItemById, getItemDependencyMetrics, getPredecessors, getSuccessors } from "../../timing-planner/src/dependencyService.js";
 import { generateRecoveryScenarios, getRecoveryReferences, validateRecoveryScenario } from "../../timing-planner/src/recoveryService.js";
 import { buildReadLanes, queryOpenAndOverduePlanItems, queryReadItems } from "./read-lanes.js";
-
-dotenv.config();
+import { createLocalAuthRouter } from "./auth/localRoutes.js";
+import { createUserRepository, LOCAL_IDENTITY_SOURCE, normalizeShortId } from "./auth/localAuth.js";
+import { createRequireAuth, requireAdmin } from "./auth/localMiddleware.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, ".env") });
+
+const SESSION_SECRET = String(process.env.SESSION_SECRET || "");
+if (SESSION_SECRET.length < 32) {
+  console.error("Refusing to start: SESSION_SECRET must be at least 32 characters.");
+  process.exit(1);
+}
 
 const app = express();
+// Vite's dev proxy runs on the same host; only trust X-Forwarded-For from loopback.
+app.set("trust proxy", "loopback");
 const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:5005,http://localhost:5173")
   .split(",")
   .map((origin) => origin.trim())
@@ -42,19 +52,33 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json({ limit: "50mb" }));
+const SESSION_COOKIE_NAME = "btv.sid";
+const sessionCookieOptions = { path: "/", httpOnly: true, sameSite: "lax", secure: String(process.env.COOKIE_SECURE || "false").toLowerCase() === "true" };
+// Default MemoryStore: single server instance assumed; sessions end when the server restarts.
 app.use(session({
-  secret: process.env.SESSION_SECRET || "btv-planner-session-secret",
+  name: SESSION_COOKIE_NAME,
+  secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: false
-  }
+  rolling: true,
+  cookie: { ...sessionCookieOptions, maxAge: Math.max(5 * 60 * 1000, Number(process.env.SESSION_IDLE_MS || 8 * 60 * 60 * 1000)) }
 }));
+app.use((req, res, next) => {
+  const auth = req.session?.auth;
+  if (!auth) return next();
+  const now = Date.now();
+  const absoluteMs = Math.max(10 * 60 * 1000, Number(process.env.SESSION_ABSOLUTE_MS || 24 * 60 * 60 * 1000));
+  const idleMs = Math.max(5 * 60 * 1000, Number(process.env.SESSION_IDLE_MS || 8 * 60 * 60 * 1000));
+  if (now - auth.loginAt > absoluteMs || now - auth.lastSeenAt > idleMs) {
+    return req.session.regenerate((error) => next(error));
+  }
+  auth.lastSeenAt = now;
+  return next();
+});
 
 const PORT = Number(process.env.PORT || 5000);
 const STORAGE_ROOT = path.resolve(process.env.BTV_STORAGE_ROOT || path.join(__dirname, "..", "BTV_PLANNER"));
+const UNASSIGNED_OWNER_USER_ID = "UNASSIGNED";
 const LLM_PROVIDER = String(process.env.LLM_PROVIDER || (process.env.OPENAI_API_KEY ? "openai" : "azure")).toLowerCase();
 const LLM_MODEL = process.env.OPENAI_MODEL || process.env.MB_GENAI_MODEL || "gpt-4.1-mini";
 
@@ -156,41 +180,11 @@ const pdfUpload = multer({
 });
 
 function normalizeUserName(value) {
-  const rawValue = String(value || "").trim();
-  const shortId = rawValue.split(/[\\/@]/).pop();
-
-  return shortId
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]/g, "")
-    .replace(/\.+/g, ".")
-    .replace(/^-+|-+$/g, "");
+  return normalizeShortId(value);
 }
 
 function resolveCurrentUser(req) {
-  const sessionUser = normalizeUserName(req.session?.user);
-  if (sessionUser) return sessionUser;
-
-  // Tests use this explicit opt-in because a browser-controlled header must never identify a
-  // real user. Production identity always comes from the signed-in session below.
-  if (process.env.ALLOW_TEST_USER_HEADER === "true") {
-    return normalizeUserName(req.headers["x-user"]);
-  }
-
-  return "";
-}
-
-function requireCurrentUser(req, res, next) {
-  const currentUser = resolveCurrentUser(req);
-  if (!currentUser) {
-    return res.status(401).json({
-      ok: false,
-      code: "AUTHENTICATION_REQUIRED",
-      error: "Enter your short ID before accessing plans."
-    });
-  }
-  req.currentUser = currentUser;
-  return next();
+  return normalizeUserName(req.authUser?.shortId || req.currentUser || "");
 }
 
 async function ensureStorageStructure() {
@@ -202,11 +196,6 @@ async function ensureStorageStructure() {
 
   for (const dir of directories) {
     await fs.mkdir(dir, { recursive: true });
-  }
-
-  const userNames = ["hemanth", "nethravathi", "shreya", "hari"];
-  for (const user of userNames) {
-    await fs.mkdir(path.join(STORAGE_ROOT, "users", user), { recursive: true });
   }
 }
 
@@ -225,7 +214,7 @@ function createPlanFileId(carline, commodity) {
   return `${cleanCarline}_${cleanCommodity}`;
 }
 
-function ensureMetadata(plan, user) {
+function ensureMetadata(plan, user, ownerUserId = "") {
   const now = new Date().toISOString();
   const owner = normalizeUserName(plan?.owner || user || "");
   const createdBy = normalizeUserName(plan?.createdBy || user || owner || "");
@@ -233,10 +222,12 @@ function ensureMetadata(plan, user) {
   const createdDate = plan?.createdDate || now;
   const lastModifiedDate = plan?.lastModifiedDate || now;
   const planId = plan?.planId || plan?.id || createPlanFileId(plan?.carline, plan?.commodity);
+  const normalizedOwnerUserId = String(plan?.ownerUserId || ownerUserId || "").trim();
 
   return {
     ...plan,
     owner,
+    ownerUserId: normalizedOwnerUserId,
     createdBy,
     lastModifiedBy,
     createdDate,
@@ -336,7 +327,7 @@ function logLoadedPlans(scope, plans) {
   }
 }
 
-async function getAllPlansForUser(owner) {
+async function getAllPlansForUser(owner, ownerUserId = "") {
   const userDir = path.join(STORAGE_ROOT, "users", owner || "");
   const files = await listJsonFiles(userDir);
   const plans = [];
@@ -347,7 +338,8 @@ async function getAllPlansForUser(owner) {
   }
 
   const uniquePlans = deduplicatePlansByStableId(plans
-    .map((plan) => ({ ...ensureMetadata({ ...plan, owner }, owner), owner }))
+    .map((plan) => ({ ...ensureMetadata({ ...plan, owner }, owner, ownerUserId), owner }))
+    .filter((plan) => userOwnsPlan(plan, { id: ownerUserId, shortId: owner }))
     .sort((a, b) => (b.lastModifiedDate || "").localeCompare(a.lastModifiedDate || "")), `user ${owner}`);
   logLoadedPlans(`user ${owner}`, uniquePlans);
   return uniquePlans;
@@ -360,9 +352,13 @@ async function getAllPlansAcrossUsers() {
 
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
-    const owner = entry.name;
-    const userPlans = await getAllPlansForUser(owner);
-    plans.push(...userPlans);
+    const owner = normalizeUserName(entry.name);
+    const ownerFiles = await listJsonFiles(path.join(usersRoot, entry.name));
+    for (const file of ownerFiles) {
+      const plan = await readPlanFileData(file);
+      if (!isStoredPlan(plan)) continue;
+      plans.push({ ...ensureMetadata(plan, owner, plan?.ownerUserId || ""), owner, _filePath: file });
+    }
   }
 
   return deduplicatePlansByStableId(
@@ -371,52 +367,49 @@ async function getAllPlansAcrossUsers() {
   );
 }
 
-async function getSharedPlans(currentUser) {
-  const usersRoot = path.join(STORAGE_ROOT, "users");
-  const excludedOwner = normalizeUserName(currentUser);
-  const plans = [];
-  let invalidCount = 0;
+async function getSharedPlans(currentUser, currentUserId = "") {
+  const allPlans = await getAllPlansAcrossUsers();
+  const plans = allPlans
+    .filter((plan) => !plan.isWalkthroughDemo && !userOwnsPlan(plan, { id: currentUserId, shortId: currentUser }))
+    .map(({ ownerUserId, ...plan }) => ({ ...plan, readOnly: true }));
+  return { plans, invalidCount: 0 };
+}
 
-  let entries = [];
-  try {
-    entries = await fs.readdir(usersRoot, { withFileTypes: true });
-  } catch (error) {
-    // Surface the real reason (e.g. network share unreachable/permission denied) instead of
-    // silently reporting zero shared plans, which looks identical to "no one has shared plans".
-    const err = new Error(`Could not list the shared plans folder: ${error.message}`);
-    err.cause = error;
-    throw err;
+let ownerMigrationPromise = null;
+
+async function migrateLegacyOwnerUserIds() {
+  const users = await usersRepository.listPublicUsers();
+  const shortIdToUserId = new Map(users.map((user) => [normalizeUserName(user.shortId), String(user.id)]));
+  const allPlans = await getAllPlansAcrossUsers();
+  let updated = 0;
+
+  for (const plan of allPlans) {
+    const existingOwnerUserId = String(plan.ownerUserId || "").trim();
+    const ownerShortId = normalizeUserName(plan.owner || "");
+    // UNASSIGNED plans are re-matched once their owner registers.
+    if (existingOwnerUserId && !(existingOwnerUserId === UNASSIGNED_OWNER_USER_ID && shortIdToUserId.has(ownerShortId))) continue;
+    const ownerUserId = shortIdToUserId.get(ownerShortId) || UNASSIGNED_OWNER_USER_ID;
+    if (ownerUserId === existingOwnerUserId) continue;
+    const migrated = {
+      ...plan,
+      owner: ownerShortId,
+      ownerUserId,
+      lastModifiedDate: plan.lastModifiedDate || new Date().toISOString()
+    };
+    await writePlan(migrated, ownerShortId, ownerUserId);
+    updated += 1;
   }
 
-  for (const entry of entries) {
-    if (!entry.isDirectory() || normalizeUserName(entry.name) === excludedOwner) continue;
-    const owner = normalizeUserName(entry.name);
-    const ownerFiles = await listJsonFiles(path.join(usersRoot, entry.name));
-    for (const file of ownerFiles) {
-      const plan = await readPlanFileData(file);
-      if (!plan) {
-        invalidCount += 1;
-        continue;
-      }
-      if (!isStoredPlan(plan)) continue;
-      plans.push({
-        ...ensureMetadata(plan, owner),
-        owner,
-        readOnly: true,
-        _filePath: file
-      });
-    }
-  }
+  if (updated > 0) console.info(`[Auth migration] Backfilled ownerUserId for ${updated} plan(s).`);
+}
 
-  const uniquePlans = deduplicatePlansByStableId(
-      plans.sort((a, b) => (b.lastModifiedDate || "").localeCompare(a.lastModifiedDate || "")),
-      "shared plans"
-    );
-  logLoadedPlans(`shared plans for ${excludedOwner}`, uniquePlans);
-  return {
-    plans: uniquePlans,
-    invalidCount
-  };
+function ensureOwnerMigration() {
+  if (!ownerMigrationPromise) {
+    ownerMigrationPromise = migrateLegacyOwnerUserIds().catch((error) => {
+      console.error("Owner migration failed:", error);
+    });
+  }
+  return ownerMigrationPromise;
 }
 
 function buildPlanPath(owner, plan) {
@@ -690,23 +683,36 @@ function validateActualRecord(value, user) {
   };
 }
 
-async function requireOwnedJournalPlan(req, res) {
-  const plan = await findPlanByIdOrFileId(req.params.planId, req.currentUser);
+function userOwnsPlan(plan, user) {
+  const ownerUserId = String(plan?.ownerUserId || "").trim();
+  if (ownerUserId && ownerUserId !== UNASSIGNED_OWNER_USER_ID) {
+    return ownerUserId === String(user?.id || user?.userId || "").trim();
+  }
+  return normalizeUserName(plan?.owner || "") === normalizeUserName(user?.shortId || "");
+}
+
+async function requirePlanAccess(req, res, targetId, options = {}) {
+  void options;
+  const plan = await findPlanByIdOrFileId(targetId);
   if (!plan) {
     res.status(404).json({ ok: false, error: "Plan not found." });
     return null;
   }
-  if (normalizeUserName(plan.owner) !== normalizeUserName(req.currentUser)) {
+  if (!userOwnsPlan(plan, { id: req.currentUserId, shortId: req.currentUser })) {
     res.status(403).json(readOnlyError());
     return null;
   }
   return plan;
 }
 
-async function findPlanByIdOrFileId(targetId, requestedOwner = "") {
+async function requireOwnedJournalPlan(req, res) {
+  return requirePlanAccess(req, res, req.params.planId, { requestedOwner: req.currentUser, requestedOwnerUserId: req.currentUserId });
+}
+
+async function findPlanByIdOrFileId(targetId, requestedOwner = "", requestedOwnerUserId = "") {
   const planId = String(targetId || "");
   const allPlans = requestedOwner
-    ? await getAllPlansForUser(normalizeUserName(requestedOwner))
+    ? await getAllPlansForUser(normalizeUserName(requestedOwner), String(requestedOwnerUserId || ""))
     : await getAllPlansAcrossUsers();
   const match = allPlans.find((plan) => {
     const ids = [plan.planId, plan.id, path.basename(plan._filePath || "")];
@@ -731,14 +737,15 @@ function describeStorageError(error) {
   return error?.message || "Failed to save plan.";
 }
 
-async function writePlan(plan, currentUser) {
-  const normalizedPlan = ensureMetadata(plan, currentUser);
+async function writePlan(plan, currentUser, currentUserId) {
+  const normalizedPlan = ensureMetadata(plan, currentUser, currentUserId);
   const owner = normalizeUserName(normalizedPlan.owner || currentUser || "");
   const filePath = buildPlanPath(owner, normalizedPlan);
 
   await fs.mkdir(path.dirname(filePath), { recursive: true });
 
   normalizedPlan.owner = owner;
+  normalizedPlan.ownerUserId = String(currentUserId || normalizedPlan.ownerUserId || UNASSIGNED_OWNER_USER_ID);
   normalizedPlan.createdBy = normalizeUserName(normalizedPlan.createdBy || owner || currentUser || "");
   normalizedPlan.lastModifiedBy = normalizeUserName(currentUser || normalizedPlan.lastModifiedBy || normalizedPlan.createdBy || owner || "");
   normalizedPlan.lastModifiedDate = new Date().toISOString();
@@ -765,33 +772,85 @@ async function writePlan(plan, currentUser) {
   return { ...normalizedPlan, _filePath: filePath };
 }
 
+const usersRepository = createUserRepository({ storageRoot: process.env.BTV_AUTH_STORAGE_ROOT ? path.resolve(process.env.BTV_AUTH_STORAGE_ROOT) : STORAGE_ROOT });
+const requireCurrentUser = createRequireAuth(usersRepository);
+let credentialMigrationPromise;
+
 app.use(async (req, res, next) => {
   try {
     await ensureStorageStructure();
+    credentialMigrationPromise ||= usersRepository.migrateLegacyCredentials();
+    await credentialMigrationPromise;
+    await ensureOwnerMigration();
     next();
   } catch (error) {
     next(error);
   }
 });
 
-app.get("/api/session", (req, res) => {
-  const currentUser = resolveCurrentUser(req);
-  res.json({ ok: true, authenticated: Boolean(currentUser), user: currentUser || null });
+app.use("/api/auth", createLocalAuthRouter({ users: usersRepository, cookieName: SESSION_COOKIE_NAME, storageRoot: STORAGE_ROOT }));
+
+app.get("/api/session", requireCurrentUser, (_req, res) => {
+  const user = _req.authUser;
+  return res.json({
+    ok: true,
+    authenticated: true,
+    user: user.shortId,
+    userId: user.id,
+    displayName: user.displayName,
+    email: user.email,
+    role: user.role,
+    identitySource: LOCAL_IDENTITY_SOURCE
+  });
 });
 
-app.post("/api/session", async (req, res) => {
-  const currentUser = normalizeUserName(req.body?.shortId);
-  if (!/^[a-z]{7}$/.test(currentUser)) {
-    return res.status(400).json({ ok: false, error: "Please enter a correct short ID: 7 letters only." });
-  }
+app.get("/api/debug/whoami", requireCurrentUser, (req, res) => {
+  const user = req.authUser;
+  res.json({
+    ok: true,
+    authenticated: true,
+    user: user.shortId,
+    userId: user.id,
+    displayName: user.displayName,
+    email: user.email,
+    role: user.role,
+    identitySource: LOCAL_IDENTITY_SOURCE,
+    result: "PASS",
+    storageFolder: `users/${user.shortId}`,
+    signedInAt: new Date(req.session.auth.loginAt).toISOString()
+  });
+});
 
-  try {
-    await fs.mkdir(path.join(STORAGE_ROOT, "users", currentUser), { recursive: true });
-    req.session.user = currentUser;
-    return res.json({ ok: true, authenticated: true, user: currentUser });
-  } catch (error) {
-    return res.status(500).json({ ok: false, error: describeStorageError(error) });
+app.get("/api/admin/users", requireCurrentUser, requireAdmin, async (_req, res) => {
+  const users = await usersRepository.listPublicUsers();
+  return res.json({ ok: true, users });
+});
+
+app.patch("/api/admin/users/:id/status", requireCurrentUser, requireAdmin, async (req, res) => {
+  const result = await usersRepository.setStatus({ userId: req.params.id, status: req.body?.status, actorUserId: req.currentUserId });
+  if (!result.ok) return res.status(result.code === "NOT_FOUND" ? 404 : 400).json({ ok: false, code: result.code, error: result.error });
+  return res.json({ ok: true, user: result.user });
+});
+
+app.patch("/api/admin/users/:id/role", requireCurrentUser, requireAdmin, async (req, res) => {
+  const result = await usersRepository.setRole({ userId: req.params.id, role: req.body?.role });
+  if (!result.ok) return res.status(result.code === "NOT_FOUND" ? 404 : 400).json({ ok: false, code: result.code, error: result.error });
+  return res.json({ ok: true, user: result.user });
+});
+
+app.post("/api/admin/users/:id/unlock", requireCurrentUser, requireAdmin, async (req, res) => {
+  const result = await usersRepository.unlock({ userId: req.params.id });
+  if (!result.ok) return res.status(result.code === "NOT_FOUND" ? 404 : 400).json({ ok: false, code: result.code, error: result.error });
+  return res.json({ ok: true, user: result.user });
+});
+
+app.post("/api/admin/users/:id/reset-password", requireCurrentUser, requireAdmin, async (req, res) => {
+  if (req.body?.password || req.body?.newPassword) {
+    return res.status(400).json({ ok: false, error: "Passwords cannot be assigned by the admin API. Use the manually verified reset procedure." });
   }
+  const result = await usersRepository.requirePasswordReset({ userId: req.params.id });
+  if (!result.ok) return res.status(result.code === "NOT_FOUND" ? 404 : 400).json({ ok: false, code: result.code, error: result.error });
+  return res.json({ ok: true, user: result.user });
 });
 
 app.use(["/api/plans", "/api/storage", "/api/walkthrough"], requireCurrentUser);
@@ -817,8 +876,8 @@ app.put("/api/walkthrough/:walkthroughId", async (req, res) => {
 app.delete("/api/walkthrough/:walkthroughId/demo/:planId", async (req, res) => {
   try {
     const state = await readWalkthroughState(req.currentUser, req.params.walkthroughId);
-    const plan = await findPlanByIdOrFileId(req.params.planId, req.currentUser);
-    if (!state || !plan || state.demoPlanId !== String(plan.planId || plan.id) || !plan.isWalkthroughDemo || normalizeUserName(plan.owner) !== req.currentUser || !plan.walkthroughSessionId || plan.walkthroughSessionId !== state.walkthroughSessionId) {
+    const plan = await findPlanByIdOrFileId(req.params.planId, req.currentUser, req.currentUserId);
+    if (!state || !plan || !userOwnsPlan(plan, { id: req.currentUserId, shortId: req.currentUser }) || state.demoPlanId !== String(plan.planId || plan.id) || !plan.isWalkthroughDemo || !plan.walkthroughSessionId || plan.walkthroughSessionId !== state.walkthroughSessionId) {
       return res.status(403).json({ ok: false, error: "This plan is not the active walkthrough demo for the authenticated user." });
     }
     await fs.unlink(plan._filePath || buildPlanPath(req.currentUser, plan));
@@ -834,19 +893,19 @@ app.delete("/api/walkthrough/:walkthroughId/demo/:planId", async (req, res) => {
 
 app.get("/api/plans/my", async (req, res) => {
   const currentUser = req.currentUser;
-  const plans = await getAllPlansForUser(currentUser);
+  const plans = await getAllPlansForUser(currentUser, req.currentUserId);
   res.json({ ok: true, plans, planCount: plans.length });
 });
 
 app.get("/api/plans/team", async (req, res) => {
-  const plans = await getAllPlansAcrossUsers();
-  res.json({ ok: true, plans: plans.map(readOnlyPlanResponse) });
+  void req;
+  res.json({ ok: true, plans: [] });
 });
 
 app.get("/api/plans/shared", async (req, res) => {
   try {
     const currentUser = req.currentUser;
-    const result = await getSharedPlans(currentUser);
+    const result = await getSharedPlans(currentUser, req.currentUserId);
     res.json({
       ok: true,
       plans: result.plans.map(readOnlyPlanResponse),
@@ -1083,19 +1142,9 @@ app.put("/api/plans/:planId/actuals", async (req, res) => {
 });
 
 app.get("/api/plans/:id", async (req, res) => {
-  const currentUser = req.currentUser;
-  const requestedOwner = normalizeUserName(req.query.owner || "");
-  const plan = requestedOwner
-    ? await findPlanByIdOrFileId(req.params.id, requestedOwner)
-    : await findPlanByIdOrFileId(req.params.id);
-  if (!plan) {
-    return res.status(404).json({ ok: false, error: "Plan not found" });
-  }
-
-  return res.json({ ok: true, plan: readOnlyPlanResponse({
-    ...plan,
-    readOnly: normalizeUserName(plan.owner) !== normalizeUserName(currentUser)
-  }) });
+  const plan = await requirePlanAccess(req, res, req.params.id, { requestedOwner: req.currentUser, requestedOwnerUserId: req.currentUserId });
+  if (!plan) return;
+  return res.json({ ok: true, plan: readOnlyPlanResponse({ ...plan, readOnly: false }) });
 });
 
 app.post("/api/plans/save", async (req, res) => {
@@ -1113,17 +1162,18 @@ app.post("/api/plans/save", async (req, res) => {
     // A plan ID identifies its owner across the workspace. Do not let another user create a
     // same-ID copy through the save endpoint; they must use the explicit copy endpoint instead.
     const existingPlan = await findPlanByIdOrFileId(plan.planId);
-    if (existingPlan && normalizeUserName(existingPlan.owner) !== owner) {
+    if (existingPlan && !userOwnsPlan(existingPlan, { id: req.currentUserId, shortId: req.currentUser })) {
       return res.status(403).json(readOnlyError());
     }
 
     const savedPlan = await writePlan({
       ...plan,
       owner,
+      ownerUserId: req.currentUserId,
       createdBy: normalizeUserName(plan.createdBy || currentUser),
       lastModifiedBy: normalizeUserName(currentUser),
       lastModifiedDate: new Date().toISOString()
-    }, currentUser);
+    }, currentUser, req.currentUserId);
 
     return res.json({ ok: true, plan: readOnlyPlanResponse(savedPlan) });
   } catch (error) {
@@ -1135,14 +1185,14 @@ app.post("/api/plans/save", async (req, res) => {
 app.post("/api/plans/copy", async (req, res) => {
   try {
     const currentUser = req.currentUser;
-    const { planId, sourceOwner, carline, commodity, planName } = req.body || {};
+    const { planId, carline, commodity, planName } = req.body || {};
     if (!planId) {
       return res.status(400).json({ ok: false, error: "Plan id is required." });
     }
 
-    const sourcePlan = await findPlanByIdOrFileId(planId, normalizeUserName(sourceOwner || ""));
-
-    if (!sourcePlan) {
+    // Any signed-in user may copy a shared plan; only the baseline Build Plan is copied below.
+    const sourcePlan = await findPlanByIdOrFileId(planId);
+    if (!sourcePlan || sourcePlan.isWalkthroughDemo) {
       return res.status(404).json({ ok: false, error: "Plan not found." });
     }
 
@@ -1158,6 +1208,7 @@ app.post("/api/plans/copy", async (req, res) => {
       planId: copyId,
       id: copyId,
       owner: currentUser,
+      ownerUserId: req.currentUserId,
       carline: String(carline || sourcePlan.carline || "").trim(),
       commodity: String(commodity || sourcePlan.commodity || "").trim(),
       supplier: String(sourcePlan.supplier || "").trim(),
@@ -1177,7 +1228,7 @@ app.post("/api/plans/copy", async (req, res) => {
       copiedFromPlanId: String(sourcePlan.planId || sourcePlan.id || planId)
     }, currentUser);
 
-    const saved = await writePlan(copiedPlan, currentUser);
+    const saved = await writePlan(copiedPlan, currentUser, req.currentUserId);
     return res.json({ ok: true, plan: readOnlyPlanResponse(saved) });
   } catch (error) {
     console.error("Copy plan error:", error);
@@ -1187,15 +1238,8 @@ app.post("/api/plans/copy", async (req, res) => {
 
 app.delete("/api/plans/:id", async (req, res) => {
   try {
-    const currentUser = req.currentUser;
-    const plan = await findPlanByIdOrFileId(req.params.id);
-    if (!plan) {
-      return res.status(404).json({ ok: false, error: "Plan not found" });
-    }
-
-    if (normalizeUserName(plan.owner || "") !== normalizeUserName(currentUser)) {
-      return res.status(403).json(readOnlyError());
-    }
+    const plan = await requirePlanAccess(req, res, req.params.id, { requestedOwner: req.currentUser, requestedOwnerUserId: req.currentUserId });
+    if (!plan) return;
 
     const filePath = plan._filePath || buildPlanPath(plan.owner, plan);
     await fs.unlink(filePath);
@@ -1210,7 +1254,7 @@ app.delete("/api/plans/:id", async (req, res) => {
 // Structured Senior BTV Planner Advisor Prompt (Step 6.2.d)
 // ─────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = [
-  "You are the AI Planning Advisor inside the BTV Planning Agent tool.",
+  "You are the AI Planning Advisor inside the BTV MITRA tool.",
   "You act as a senior BTV component timing planner at Mercedes-AMG in the AMG Chassis Team,",
   "with over 20 years of experience in component development planning, tooling risk analysis,",
   "sampling strategy, PPAP readiness, and supplier maturity assessment.",
@@ -1853,7 +1897,7 @@ const READ_ONLY_CHAT_SYSTEM_PROMPT = [
 // Concierge Chat Prompt (Step 6.3.d)
 // ─────────────────────────────────────────────────────────────
 const CHAT_SYSTEM_PROMPT = [
-  "You are the AI concierge inside the BTV Planning Agent tool.",
+  "You are the AI concierge inside the BTV MITRA tool.",
   "You act as a senior BTV component timing planner assistant at Mercedes-AMG.",
   "You have over 20 years of experience in component development planning, tooling risk,",
   "sampling strategy, PPAP readiness, and supplier maturity.",
@@ -1913,7 +1957,7 @@ const CHAT_SYSTEM_PROMPT = [
 
 const MILESTONE_SYSTEM_PROMPT = [
   "You are a senior BTV component timing planner at Mercedes-AMG in the AMG Chassis Team.",
-  "You are the AI Optimizer inside the BTV Planning Agent tool.",
+  "You are the AI Optimizer inside the BTV MITRA tool.",
   "",
   "You will be given a BTV component development plan as JSON in the user message.",
   "Your task is to propose a REFINED milestone plan that respects real-world engineering constraints.",
@@ -2554,8 +2598,8 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
       return -1;
     })();
     const latestUserText = latestUserIndex >= 0 ? String(messages[latestUserIndex]?.content || "") : "";
-    const ownedPlans = await getAllPlansForUser(req.currentUser);
-    const sharedPlans = (await getSharedPlans(req.currentUser)).plans;
+    const ownedPlans = await getAllPlansForUser(req.currentUser, req.currentUserId);
+    const sharedPlans = (await getSharedPlans(req.currentUser, req.currentUserId)).plans;
     const availablePlans = deduplicatePlansByStableId([...ownedPlans, ...sharedPlans], `chat context for ${req.currentUser}`);
     logLoadedPlans(`chat context for ${req.currentUser}`, availablePlans);
     if (Number.isInteger(clientPlanCount) && clientPlanCount !== availablePlans.length) {
@@ -2990,6 +3034,11 @@ app.post("/ai-milestones", async (req, res) => {
     console.error("AI milestones error:", err);
     return res.status(500).json({ ok: false, error: err.message || "AI milestones request failed" });
   }
+});
+
+app.use((error, _req, res, _next) => {
+  console.error("Request failed:", error?.code || "INTERNAL_ERROR");
+  res.status(500).json({ ok: false, error: "The service could not complete the request." });
 });
 
 process.on("uncaughtException", (err) => {

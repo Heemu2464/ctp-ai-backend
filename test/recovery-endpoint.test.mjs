@@ -1,26 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { spawn } from "node:child_process";
 import { generateRecoveryScenarios } from "../../../timing-planner/src/recoveryService.js";
+import { mockUser, startTestServer } from "./helpers/testServer.mjs";
 
-const root = await mkdtemp(path.join(os.tmpdir(), "btv-recovery-endpoint-"));
-const port = 6200 + Math.floor(Math.random() * 500);
-const server = spawn(process.execPath, [path.resolve("server.js")], {
-  cwd: path.resolve("."),
-  env: { ...process.env, PORT: String(port), BTV_STORAGE_ROOT: root, ALLOW_TEST_USER_HEADER: "true", MB_GENAI_API_KEY: "test-key", MB_GENAI_API_VERSION: "2024-10-21", MB_GENAI_ENDPOINT: "https://example.invalid" },
-  stdio: "ignore"
-});
-const api = `http://localhost:${port}`;
-const headers = { "Content-Type": "application/json", "x-user": "recovery-tester" };
+const USER = "rectest";
+const server = await startTestServer({ users: [mockUser(USER)] });
+const { api } = server;
+const headers = { "Content-Type": "application/json", cookie: await server.login(USER) };
 const planId = "x591-recovery";
 const basePlan = (duplicateRuleBuild = true) => ({
   id: planId,
   planId,
-  owner: "recovery-tester",
-  createdBy: "recovery-tester",
-  lastModifiedBy: "recovery-tester",
+  owner: USER,
+  createdBy: USER,
+  lastModifiedBy: USER,
   carline: "X591",
   commodity: "Recovery test",
   builds: [{ id: "b-build", name: "B-Build", start: "2026-10-20", end: "2026-10-20" }],
@@ -31,14 +23,6 @@ const basePlan = (duplicateRuleBuild = true) => ({
   subActivities: [],
   actuals: { "custom:customPlan:pv": { date: "2026-10-02", delayReason: "Supplier" } }
 });
-
-async function waitForServer() {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
-    try { if ((await fetch(`${api}/health`)).ok) return; } catch {}
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  throw new Error("Recovery endpoint test server did not start");
-}
 
 async function save(plan) {
   const response = await fetch(`${api}/api/plans/save`, { method: "POST", headers, body: JSON.stringify(plan) });
@@ -58,7 +42,6 @@ function sessionFor(plan, constraints = []) {
 }
 
 try {
-  await waitForServer();
   const duplicated = basePlan(true);
   await save(duplicated);
   const duplicateResponse = await chat("Protect B-Build", sessionFor(duplicated));
@@ -105,6 +88,5 @@ try {
   assert.equal(stale.recoveryAction.type, "stale");
   console.log("recovery endpoint tests passed");
 } finally {
-  server.kill();
-  await rm(root, { recursive: true, force: true });
+  await server.stop();
 }
