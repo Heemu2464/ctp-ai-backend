@@ -13,6 +13,7 @@ auth/users.json.*
 private-data/
 **/auth/users.json
 **/auth/users.json.*
+**/auth/sessions/
 BTV_PLANNER/
 **/captured-mail*.jsonl
 dev/mock-directory.json

@@ -10,6 +10,33 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createRequireAuth } from "../auth/localMiddleware.js";
 import { createLocalAuthRouter } from "../auth/localRoutes.js";
+import { PersistentSessionStore } from "../auth/sessionStore.js";
+
+test("persistent sessions are encrypted and late writes cannot recreate a logged-out session", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "btv-session-test-"));
+  const options = { path: directory, ttl: 3600, retries: 0, reapInterval: -1, secret: "unit_test_session_encryption_secret_123456789", logFn: () => {} };
+  const store = new PersistentSessionStore(options);
+  const call = (instance, method, ...args) => new Promise((resolve, reject) => instance[method](...args, (error, value) => error ? reject(error) : resolve(value)));
+  const sessionId = "unit-remembered-session";
+  const value = { cookie: { expires: new Date(Date.now() + 3600000).toISOString(), originalMaxAge: 3600000 }, auth: { userId: "usr_remembered", identitySource: "local-pilot-auth", credentialVersion: 1 } };
+  try {
+    await call(store, "set", sessionId, value);
+    const stored = await readFile(path.join(directory, `${sessionId}.json`), "utf8");
+    assert.doesNotMatch(stored, /usr_remembered|identitySource|credentialVersion/);
+    const reopened = new PersistentSessionStore(options);
+    assert.deepEqual((await call(reopened, "get", sessionId)).auth, value.auth);
+    await Promise.all([
+      ...Array.from({ length: 10 }, () => call(store, "set", sessionId, value)),
+      call(store, "destroy", sessionId),
+      ...Array.from({ length: 10 }, () => call(store, "set", sessionId, value)),
+      call(store, "touch", sessionId, value)
+    ]);
+    assert.equal(await call(store, "get", sessionId), null);
+    await assert.rejects(readFile(path.join(directory, `${sessionId}.json`)), { code: "ENOENT" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("password policy rejects weak, missing, non-string and oversized values without coercion", async () => {
   for (const password of [undefined, null, {}, 1234567890, "weak", "onlylowercase123!", "ALLUPPERCASE123!", "NoNumbersHere!", "NoSymbolsHere123", `Aa1!${"x".repeat(69)}`]) {

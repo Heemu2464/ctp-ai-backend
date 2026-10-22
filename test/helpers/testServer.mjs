@@ -79,20 +79,31 @@ export async function startTestServer({ users = [], env = {}, prepare, separateA
   if (prepare) await prepare(root);
   const port = await freePort();
   const api = `http://127.0.0.1:${port}`;
-  const { child, output, exited } = spawnServer({
+  const serverEnv = {
     PORT: String(port),
     BTV_STORAGE_ROOT: root,
     BTV_AUTH_STORAGE_ROOT: authRoot,
     SESSION_SECRET: "this_is_a_test_session_secret_that_is_long_enough_123",
     ...env
-  }, { cwd: dir });
+  };
+  let { child, output, exited } = spawnServer(serverEnv, { cwd: dir });
 
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      if ((await fetch(`${api}/health`)).ok) break;
-    } catch {}
-    if (attempt > 150) throw new Error(`Backend did not start:\n${output.join("")}`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+  async function waitForReady() {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        if ((await fetch(`${api}/health`)).ok) break;
+      } catch {}
+      if (attempt > 150) throw new Error(`Backend did not start:\n${output.join("")}`);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  await waitForReady();
+
+  async function restart() {
+    child.kill();
+    await exited;
+    ({ child, output, exited } = spawnServer(serverEnv, { cwd: dir }));
+    await waitForReady();
   }
 
   const responses = [];
@@ -130,5 +141,5 @@ export async function startTestServer({ users = [], env = {}, prepare, separateA
     await rm(dir, { recursive: true, force: true });
   }
 
-  return { api, root, authRoot, dir, output, responses, call, readMails, waitForMail, codeFrom, login, readAudit, stop };
+  return { api, root, authRoot, dir, output, responses, call, readMails, waitForMail, codeFrom, login, readAudit, restart, stop };
 }

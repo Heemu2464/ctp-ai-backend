@@ -5,11 +5,14 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import session from "express-session";
+import { PersistentSessionStore } from "./auth/sessionStore.js";
 import OpenAI, { AzureOpenAI } from "openai";
 import multer from "multer";
 import { PDFParse } from "pdf-parse";
 import { canPerform, createActionToolDefinitions, createReadOnlyToolDefinitions, getPlanItemDates, updateItemDates } from "../../timing-planner/src/plannerActions.js";
-import { createPlanResolverContext, resolveItem, resolveLane, resolvePlan } from "../../timing-planner/src/plannerResolvers.js";
+import { parseDurationChangeCommand, parseMoveCommand, relativeCreateDates } from "../../timing-planner/src/chatCommands.js";
+import { createPlanResolverContext, resolveItem, resolveItemForEdit, resolveLane, resolvePlan } from "../../timing-planner/src/plannerResolvers.js";
+import { getMyPlanSlot } from "../../timing-planner/src/myPlans.js";
 import { analyzeCriticalPathImpact, analyzeDownstreamImpact, analyzeScheduleConflicts, buildCascadeProposal, calculateCriticalPath, getAllAncestors, getAllDescendants, getItemById, getItemDependencyMetrics, getPredecessors, getSuccessors } from "../../timing-planner/src/dependencyService.js";
 import { generateRecoveryScenarios, getRecoveryReferences, validateRecoveryScenario } from "../../timing-planner/src/recoveryService.js";
 import { buildReadLanes, queryOpenAndOverduePlanItems, queryReadItems } from "./read-lanes.js";
@@ -57,10 +60,20 @@ const SESSION_COOKIE_NAME = "btv.sid";
 const sessionCookieOptions = { path: "/", httpOnly: true, sameSite: "lax", secure: String(process.env.COOKIE_SECURE || "false").toLowerCase() === "true" };
 const REMEMBER_ME_MAX_AGE_MS = Math.max(60 * 60 * 1000, Number(process.env.REMEMBER_ME_MAX_AGE_MS || 30 * 24 * 60 * 60 * 1000));
 app.locals.rememberMeMaxAgeMs = REMEMBER_ME_MAX_AGE_MS;
-// Default MemoryStore: single server instance assumed; sessions end when the server restarts.
+const STORAGE_ROOT = path.resolve(process.env.BTV_STORAGE_ROOT || path.join(__dirname, "..", "BTV_PLANNER"));
+const AUTH_STORAGE_ROOT = process.env.BTV_AUTH_STORAGE_ROOT ? path.resolve(process.env.BTV_AUTH_STORAGE_ROOT) : STORAGE_ROOT;
+const SESSION_STORAGE_DIRECTORY = path.join(AUTH_STORAGE_ROOT, "auth", "sessions");
+const sessionStore = new PersistentSessionStore({
+  path: SESSION_STORAGE_DIRECTORY,
+  secret: SESSION_SECRET,
+  ttl: Math.ceil(REMEMBER_ME_MAX_AGE_MS / 1000),
+  retries: 0,
+  logFn: () => {}
+});
 app.use(session({
   name: SESSION_COOKIE_NAME,
   secret: SESSION_SECRET,
+  store: sessionStore,
   resave: false,
   saveUninitialized: false,
   rolling: true,
@@ -84,7 +97,6 @@ app.use((req, res, next) => {
 });
 
 const PORT = Number(process.env.PORT || 5000);
-const STORAGE_ROOT = path.resolve(process.env.BTV_STORAGE_ROOT || path.join(__dirname, "..", "BTV_PLANNER"));
 const UNASSIGNED_OWNER_USER_ID = "UNASSIGNED";
 const LLM_PROVIDER = String(process.env.LLM_PROVIDER || (process.env.OPENAI_API_KEY ? "openai" : "azure")).toLowerCase();
 const LLM_MODEL = process.env.OPENAI_MODEL || process.env.MB_GENAI_MODEL || "gpt-4.1-mini";
@@ -127,6 +139,9 @@ function buildUserContentWithPdf(text, referenceImages = [], pdfDataUrl = "", pd
   return parts;
 }
 
+const CHAT_REASONING_EFFORT = String(process.env.CHAT_REASONING_EFFORT || "low").trim();
+let reasoningEffortSupported = true;
+
 async function requestModel(messages, options = {}) {
   const payload = {
     model: LLM_MODEL,
@@ -135,7 +150,19 @@ async function requestModel(messages, options = {}) {
   if (options.maxTokens) payload.max_tokens = options.maxTokens;
   if (options.tools) payload.tools = options.tools;
   if (options.toolChoice) payload.tool_choice = options.toolChoice;
-  const completion = await client.chat.completions.create(payload);
+  if (options.reasoningEffort && reasoningEffortSupported) payload.reasoning_effort = options.reasoningEffort;
+  const startedAt = performance.now();
+  let completion;
+  try {
+    completion = await client.chat.completions.create(payload);
+  } catch (error) {
+    // Non-reasoning deployments reject reasoning_effort; drop it once and remember.
+    if (!payload.reasoning_effort || error?.status !== 400 || !/reasoning/i.test(String(error?.message || ""))) throw error;
+    reasoningEffortSupported = false;
+    delete payload.reasoning_effort;
+    completion = await client.chat.completions.create(payload);
+  }
+  if (options.label) console.info(`[LLM timing] ${options.label} ${Math.round(performance.now() - startedAt)}ms prompt=${completion.usage?.prompt_tokens ?? "?"} completion=${completion.usage?.completion_tokens ?? "?"}`);
   return options.returnMessage ? (completion.choices?.[0]?.message || {}) : (completion.choices?.[0]?.message?.content || "");
 }
 
@@ -779,7 +806,7 @@ async function writePlan(plan, currentUser, currentUserId) {
   return { ...normalizedPlan, _filePath: filePath };
 }
 
-const usersRepository = createUserRepository({ storageRoot: process.env.BTV_AUTH_STORAGE_ROOT ? path.resolve(process.env.BTV_AUTH_STORAGE_ROOT) : STORAGE_ROOT });
+const usersRepository = createUserRepository({ storageRoot: AUTH_STORAGE_ROOT });
 const requireCurrentUser = createRequireAuth(usersRepository);
 let credentialMigrationPromise;
 
@@ -788,6 +815,7 @@ app.use(async (req, res, next) => {
     await ensureStorageStructure();
     credentialMigrationPromise ||= usersRepository.migrateLegacyCredentials();
     await credentialMigrationPromise;
+    await fs.mkdir(SESSION_STORAGE_DIRECTORY, { recursive: true, mode: 0o700 });
     await ensureOwnerMigration();
     next();
   } catch (error) {
@@ -1627,13 +1655,15 @@ function describeResolvedItem(plan, item) {
   return dates ? { ...item, name: step.name || item.name, ...dates, native: step } : null;
 }
 
-function resolveOperationItems(text, context, plan) {
-  const direct = resolveItem(text, context);
+function resolveOperationItems(text, context, plan, options = {}) {
+  const direct = resolveItemForEdit(text, context, { selectedLane: options.selectedLane, selectedItemId: options.selectedItemId, finalLaneId: getMyPlanSlot(plan.finalPlanSource)?.laneId });
   if (direct.status === "resolved") return { status: "resolved", items: [direct.candidate] };
-  const lane = resolveLane(text, context);
-  if (lane.status === "resolved") return { status: "resolved", items: context.items.filter((item) => item.laneId === lane.value) };
+  if (direct.status === "ambiguous") return direct;
   const query = String(text || "").toLowerCase();
-  const namedLane = context.lanes.find((candidate) => query.includes(String(candidate.name || "").toLowerCase()));
+  const exactLane = context.lanes.find((lane) => normalizeAgentText(lane.name) === normalizeAgentText(query));
+  if (exactLane) return { status: "resolved", items: context.items.filter((item) => item.laneId === exactLane.id) };
+  if (!/\b(?:all|every|everything|entire)\b/.test(query)) return direct;
+  const namedLane = [...context.lanes].sort((first, second) => second.name.length - first.name.length).find((candidate) => query.includes(String(candidate.name || "").toLowerCase()));
   if (namedLane) return { status: "resolved", items: context.items.filter((item) => item.laneId === namedLane.id) };
   const monthNames = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
   const month = monthNames.findIndex((name) => query.includes(name));
@@ -1641,6 +1671,7 @@ function resolveOperationItems(text, context, plan) {
     const prefix = `-${String(month + 1).padStart(2, "0")}-`;
     return { status: "resolved", items: context.items.filter((item) => describeResolvedItem(plan, item)?.startDate.includes(prefix)) };
   }
+  if (/\b(?:all|every|everything|entire)\b/.test(query)) return { status: "resolved", items: context.items.filter((item) => context.lanes.some((lane) => lane.id === item.laneId && lane.editable)) };
   return direct;
 }
 
@@ -1668,6 +1699,11 @@ function parseConversationDate(value, timeZone) {
 
 function parseTimelineEditIntent(text, timeZone) {
   const input = String(text || "").trim();
+  const duration = parseDurationChangeCommand(input);
+  if (duration) return { action: "updateItem", intentType: "EDIT_DURATION", args: duration };
+  const move = parseMoveCommand(input, localDateOnly(timeZone));
+  if (move?.deltaDays) return { action: "shiftItems", intentType: "EDIT_DATE", args: { items: move.item, deltaDays: move.deltaDays } };
+  if (move?.startDate) return { action: "updateItem", intentType: "EDIT_DATE", args: { item: move.item, startDate: move.startDate } };
   let match = /^rename\s+(.+?)\s+to\s+(.+)$/i.exec(input);
   if (match) return { action: "updateItem", intentType: "RENAME_ITEM", args: { item: match[1].trim(), name: match[2].trim() } };
 
@@ -1863,7 +1899,8 @@ async function createProposal(tool, args, plan, options = {}) {
     items: [
       ...context.items,
       ...Object.values(plan.milestones || {}).filter((milestone) => milestone?.plannedDate || milestone?.overrideDate).map((milestone) => ({ id: `rule:${milestone.key}`, name: milestone.name || "Rule milestone", laneId: "rule-plan", kind: "readOnlyItem", startDate: milestone.overrideDate || milestone.plannedDate, endDate: milestone.overrideDate || milestone.plannedDate })),
-      ...(plan.builds || []).filter((build) => build?.start || build?.date).map((build, index) => ({ id: `build:${build.id ?? index}`, name: build.name || build.label || "Build", laneId: "build-plan", kind: "readOnlyItem", startDate: build.start || build.date, endDate: build.end || build.endDate || build.start || build.date }))
+      ...(plan.builds || []).filter((build) => build?.start || build?.date).map((build, index) => ({ id: `build:${build.id ?? index}`, name: build.name || build.label || "Build", laneId: "build-plan", kind: "readOnlyItem", startDate: build.start || build.date, endDate: build.end || build.endDate || build.start || build.date })),
+      ...(options.pendingItems || [])
     ]
   };
   const planState = { owned: !plan.readOnly && !plan.sharedFolder, readOnly: Boolean(plan.readOnly || plan.sharedFolder), lanes: allLanes };
@@ -1910,7 +1947,7 @@ async function createProposal(tool, args, plan, options = {}) {
     const rawTarget = tool === "shiftItems" ? args.items : args.item;
     const resolvedItems = options.targetItemId
       ? { status: "resolved", items: operationContext.items.filter((item) => String(item.id) === String(options.targetItemId)) }
-      : resolveOperationItems(rawTarget, operationContext, plan);
+      : resolveOperationItems(rawTarget, operationContext, plan, options);
     if (resolvedItems.status !== "resolved") return { error: resolverFailure(resolvedItems) };
     const items = resolvedItems.items.map((item) => describeResolvedItem(plan, item)).filter(Boolean);
     if (!items.length) return { error: { ok: false, status: "not_found", message: "No editable dated items matched." } };
@@ -1920,7 +1957,7 @@ async function createProposal(tool, args, plan, options = {}) {
     if (tool === "updateItem") {
       if (items.length !== 1) return { error: { ok: false, status: "ambiguous", message: "Choose one item to update." } };
       const name = args.name ?? args.patch?.name ?? items[0].name;
-      const dates = updateItemDates(plan, items[0], { startDate: args.startDate ?? args.patch?.startDate, endDate: args.endDate ?? args.patch?.endDate, durationWeeks: args.durationWeeks ?? args.patch?.durationWeeks });
+      const dates = updateItemDates(plan, items[0], { startDate: args.startDate ?? args.patch?.startDate, endDate: args.endDate ?? args.patch?.endDate, durationDays: args.durationDays ?? args.patch?.durationDays, durationWeeks: args.durationWeeks ?? args.patch?.durationWeeks });
       if (dates.error) return { error: { ok: false, status: "rejected", message: dates.error } };
       const next = { name, ...dates.dates };
       const changes = diffFields(items[0], next);
@@ -1943,13 +1980,51 @@ async function createProposal(tool, args, plan, options = {}) {
     const actual = records.find((record) => String(record.plannedItemId) === String(item.kind === "customMilestone" ? item.milestoneKey : item.stepId));
     return { action: tool, intentType: args.intentType || "DELETE_ITEM", planRef: String(plan.planId || plan.id), input: { item: (({ native, name, laneId, startDate, endDate, ...target }) => target)(item) }, laneName: targetLane.name, preview: { kind: "delete", item, actual: actual ? { date: actual.actualEndDate || actual.actualStartDate || "", delayDays: actual.delayDays ?? null } : null } };
   }
-  const lane = resolveLane(args.lane, { lanes: allLanes });
+  const defaultLane = context.lanes.find((candidate) => candidate.id === options.selectedLane) || context.lanes.find((candidate) => candidate.id === getMyPlanSlot(plan.finalPlanSource)?.laneId) || context.lanes.find((candidate) => candidate.id === "my-plan") || context.lanes[0];
+  const lane = resolveLane(args.lane || defaultLane?.name || "", { lanes: allLanes });
   if (lane.status !== "resolved") return { error: resolverFailure(lane) };
   const targetLane = lane.candidate;
   const permission = canPerform(tool, targetLane, planState);
   if (!permission.allowed) return { error: { ok: false, status: "rejected", message: permission.reason } };
-  const endDate = args.endDate || args.startDate;
-  return { action: tool, planRef: String(plan.planId || plan.id), input: { ...args, lane: lane.value, endDate, type: endDate === args.startDate ? "milestone" : "duration" }, laneName: lane.candidate.name };
+  const { anchorItem, relation, offsetDays, ...rest } = args;
+  if (rest.durationDays !== undefined && rest.durationDays !== null && (!Number.isInteger(Number(rest.durationDays)) || Number(rest.durationDays) < 1)) return { error: { ok: false, status: "rejected", message: "Duration must be a positive whole number of calendar days." } };
+  let startDate = rest.startDate;
+  let endDate = rest.endDate;
+  let anchorNote = "";
+  if (anchorItem) {
+    const anchor = resolveItemForEdit(anchorItem, operationContext, { selectedLane: targetLane.id, finalLaneId: getMyPlanSlot(plan.finalPlanSource)?.laneId });
+    if (anchor.status !== "resolved") return { error: resolverFailure(anchor) };
+    const anchorDates = anchor.candidate.startDate ? anchor.candidate : getPlanItemDates(plan, anchor.candidate);
+    if (!anchorDates?.startDate) return { error: { ok: false, status: "not_found", message: `${anchor.candidate.name} has no date to plan from.` } };
+    const dates = relativeCreateDates({ relation: relation || "after", offsetDays: Math.max(0, Number(offsetDays) || 0), durationDays: Number(rest.durationDays) || Math.max(0, Number(rest.durationWeeks) || 0) * 7, ...(rest.durationDays ? { durationUnit: "days" } : {}) }, anchorDates.startDate, anchorDates.endDate || anchorDates.startDate);
+    ({ startDate, endDate } = dates);
+    anchorNote = `${relation === "end_before" ? "ending " : ""}${Number(offsetDays) || 0} days ${relation === "end_before" ? "before" : relation || "after"} ${anchor.candidate.name} (${anchorDates.startDate})`;
+  } else if (startDate && Number(rest.durationDays) >= 1 && (!endDate || endDate === startDate)) {
+    endDate = addDays(startDate, Number(rest.durationDays) - 1);
+  } else if (startDate && !endDate && Number(rest.durationWeeks) > 1) {
+    endDate = addDays(startDate, (Number(rest.durationWeeks) - 1) * 7);
+  }
+  if (!startDate) return { error: { ok: false, status: "rejected", message: "A start date or an anchor item is required." } };
+  endDate ||= startDate;
+  const durationWeeks = Math.max(1, Math.round((Date.parse(endDate) - Date.parse(startDate)) / (7 * 86400000)) + 1);
+  return { action: tool, planRef: String(plan.planId || plan.id), input: { ...rest, lane: lane.value, startDate, endDate, durationWeeks, type: endDate === startDate ? "milestone" : "duration" }, laneName: lane.candidate.name, anchorNote };
+}
+
+// Replaces a second model round once a write proposal exists; the UI renders the confirm controls.
+function describeWriteProposal(proposal) {
+  const input = proposal.input || {};
+  const target = proposal.preview?.item?.name || input.item?.name || input.name || "the item";
+  if (proposal.action === "createPlanLane") return `Create My Plan from the Rule-Based Plan (${proposal.copiedCount || 0} milestones)? Confirm to apply.`;
+  if (proposal.action === "createSubActivityLane") return `Create sub-activity lane ${input.name}? Confirm to apply.`;
+  if (proposal.action === "createMilestone" || proposal.action === "createSubActivity") {
+    const span = input.endDate && input.endDate !== input.startDate ? `${input.startDate} → ${input.endDate} (${input.durationDays ? `${input.durationDays} calendar days` : `${input.durationWeeks} week${input.durationWeeks === 1 ? "" : "s"}`})` : input.startDate;
+    return `Using ${proposal.laneName}. Create ${input.name}: ${span}${proposal.anchorNote ? `, ${proposal.anchorNote}` : ""}. Confirm to apply.`;
+  }
+  if (proposal.action === "shiftItems") return `Shift ${(proposal.preview?.changes || []).map((change) => change.item?.name).filter(Boolean).join(", ") || target} by ${input.deltaDays} days? Confirm to apply.`;
+  if (proposal.action === "updateItem") return `Update ${target}: ${(proposal.preview?.changes || []).map((change) => `${change.field} ${change.before} → ${change.after}`).join(", ")}. Confirm to apply.`;
+  if (proposal.action === "deleteItem") return `Delete ${target}? Confirm to apply.`;
+  if (proposal.action === "markComplete") return `Mark ${target} complete on ${input.actualCompletionDate}? Confirm to apply.`;
+  return "Proposal ready. Confirm to apply.";
 }
 
 const READ_ONLY_CHAT_SYSTEM_PROMPT = [
@@ -1960,8 +2035,15 @@ const READ_ONLY_CHAT_SYSTEM_PROMPT = [
   "Ask a clarifying question only when two or more distinct stable plan identities match and choosing one could make the answer wrong. Never ask about a time range, lanes, or intent category when a grounded default exists.",
   "For upcoming activities, milestones, next steps, or what is next, call queryItems with an empty date range when none is specified; the tool applies the next-30-days and all-lanes defaults. State that default in the reply. For recently or lately, query the preceding 30 days. For todos or open items across carlines, call queryAcrossPlans.",
   "Answer the most likely reading first, then briefly offer alternatives. Do not mention source-item counts, filtered counts, or truncation unless results are truncated or the engineer asks how the answer was derived. If queryItems returns no items and a nearestItem, name that item and its date.",
-  "Only createPlanLane, createSubActivityLane, createSubActivity, createMilestone, updateItem, shiftItems, deleteItem, and markComplete are available writes. createPlanLane copies the Rule-Based Plan into My Plan; never substitute a sub-activity lane named My Plan. When the user explicitly asks to create My Plan, call createPlanLane immediately. Do not say it is unavailable, do not describe a hypothetical preview, and do not ask the user to approve in prose: the tool result makes the UI render the confirmation controls. createSubActivityLane creates a new named, color-tagged lane. createSubActivity adds a dated step and createMilestone adds a marker; both may target any editable My Plan or sub-activity lane, never Build Plan or Rule-Based Plan. updateItem, shiftItems, deleteItem, and markComplete must always be proposed first: never claim they executed, and use public item or lane names only. markComplete stores the completion date on the timeline item. If a requested item has no lane, ask which editable lane to use and offer creating a new sub-activity lane without asking again for its name or dates. Use them only after all schema-required fields are known. Their tool result is a proposal, not a write; present the resolved values and wait for explicit frontend confirmation. Journal and actual-store writes are unavailable.",
-  "Use only public plan and lane names in tools. Never emit internal IDs."
+  "Only createPlanLane, createSubActivityLane, createSubActivity, createMilestone, updateItem, shiftItems, deleteItem, and markComplete are available writes. Journal and actual-store writes are unavailable.",
+  "createPlanLane copies the Rule-Based Plan into My Plan; never substitute a sub-activity lane named My Plan. When explicitly asked to create My Plan, call createPlanLane immediately and let its result render confirmation controls rather than asking for another prose approval.",
+  "createSubActivityLane creates a new named lane. createSubActivity and createMilestone both support multi-day duration bars or single-day items in any editable My Plan or sub-activity lane, never Build Plan or Rule-Based Plan. Reuse the active/finalized lane defaults below when a lane is omitted; do not ask again for fields already supplied.",
+  "All write tools return proposals, not executed changes. Present the resolved plan, lane, dates, and scope and wait for explicit frontend confirmation. Never claim a write succeeded before execution. Use public names only, and obtain genuinely missing required fields before proposing. markComplete stores the completion date on the timeline item.",
+  "Use only public plan and lane names in tools. Never emit internal IDs.",
+  "Use the open plan by default. Duplicate names in other plans are not a reason to ask which plan. For writes, explicit lane/item selection takes priority, then the selected editable lane, then the finalized editable lane, then My Plan. Ask one focused question only for a genuinely unresolved target or missing date; never repeat fields already supplied. These grounded defaults override any generic instruction to ask for a lane when omitted.",
+  "For dates relative to another item, never compute dates yourself: call createMilestone/createSubActivity with anchorItem, relation and offsetDays; pass durationDays for an exact day count or durationWeeks for a week count and omit startDate/endDate.",
+  "A duration of 2 days or more is a duration bar, even if the user calls it a milestone. For 180 days, always pass durationDays:180; never round it to weeks or supply the same start and end. Use a single-day milestone only when no multi-day duration was requested. Do not invent a missing start date: ask only for that date or an anchor, retaining the requested duration.",
+  "When the user describes several items (a story or list), call the create tool once per item in the SAME response. Later items may use earlier ones from that response as anchorItem. CW/KW n is the ISO-8601 week (Monday to Sunday); compute absolute dates for week references."
 ].join("\n");
 
 // ─────────────────────────────────────────────────────────────
@@ -2653,6 +2735,8 @@ app.post("/ai-advice", async (req, res) => {
 });
 
 app.post("/ai-chat", requireCurrentUser, async (req, res) => {
+  const chatStartedAt = performance.now();
+  res.on("finish", () => console.info(`[Chat timing] total ${Math.round(performance.now() - chatStartedAt)}ms`));
   try {
     const payload = req.body || {};
     const { messages, selectedPlanRef, selectedPlanName, selectedPlan, visibleLanes = {}, agentContext = {}, pendingAgentAction = null, recoverySession = null, timeZone: requestedTimeZone, referenceImages = [], planCount: clientPlanCount } = payload;
@@ -2671,6 +2755,7 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
     const latestUserText = latestUserIndex >= 0 ? String(messages[latestUserIndex]?.content || "") : "";
     const ownedPlans = await getAllPlansForUser(req.currentUser, req.currentUserId);
     const sharedPlans = (await getSharedPlans(req.currentUser, req.currentUserId)).plans;
+    console.info(`[Chat timing] plans loaded ${Math.round(performance.now() - chatStartedAt)}ms`);
     const availablePlans = deduplicatePlansByStableId([...ownedPlans, ...sharedPlans], `chat context for ${req.currentUser}`);
     logLoadedPlans(`chat context for ${req.currentUser}`, availablePlans);
     if (Number.isInteger(clientPlanCount) && clientPlanCount !== availablePlans.length) {
@@ -2873,7 +2958,7 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
       return res.json({ ok: true, reply: related.length ? `${related.map((entry) => entry.name).join(", ")} ${label} ${item.name}.` : `No items ${label} ${item.name}.`, intent: { type: "none", targetCarline: "", targetCommodity: "" }, dependencyAnalysis: { action: "SHOW_DEPENDENCY_CHAIN", sourceItem: { itemId: item.id, itemName: item.name, planId: String(selectedStoredPlan.planId || selectedStoredPlan.id), carline: selectedStoredPlan.carline || "", lane: item.laneName }, directSuccessors: getSuccessors(selectedStoredPlan, item.id).map((entry) => ({ itemId: entry.id, itemName: entry.name, laneId: entry.laneId })), indirectDescendants: getAllDescendants(selectedStoredPlan, item.id).map((entry) => ({ itemId: entry.id, itemName: entry.name, laneId: entry.laneId })), predecessors: getPredecessors(selectedStoredPlan, item.id).map((entry) => ({ itemId: entry.id, itemName: entry.name, laneId: entry.laneId })), result: "preview" }, navigation: { itemId: item.id, planId: String(selectedStoredPlan.planId || selectedStoredPlan.id), laneId: item.laneId, action: "SHOW_ME" } });
     }
 
-    if (pendingAgentAction?.status === "needs_clarification" && Array.isArray(pendingAgentAction.candidateItems)) {
+    if (!directEdit && pendingAgentAction?.status === "needs_clarification" && Array.isArray(pendingAgentAction.candidateItems)) {
       const candidate = selectPendingCandidate(latestUserText, pendingAgentAction.candidateItems);
       if (!candidate) {
         const field = pendingAgentAction.currentClarificationField || "item";
@@ -2906,8 +2991,25 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
 
     if (directEdit) {
       const rawTarget = directEdit.args.item || directEdit.args.items || "";
-      const currentCandidates = selectedStoredPlan ? findEditCandidates([selectedStoredPlan], rawTarget, visibleLanes) : [];
-      const candidates = currentCandidates.length ? currentCandidates : findEditCandidates(scopedPlans, rawTarget, visibleLanes);
+      const targetPlanScope = asksAllPlans ? null : focusPlan;
+      if (targetPlanScope && directEdit.action === "shiftItems" && /\b(?:all|every|everything|entire)\b/i.test(rawTarget)) {
+        const proposal = await createProposal(directEdit.action, directEdit.args, targetPlanScope, { visibleLanes, selectedLane: agentContext.selectedLane });
+        if (!proposal || proposal.error) return res.json({ ok: true, reply: proposal?.error?.message || "No editable items matched this bulk request.", intent: { type: "none", targetCarline: "", targetCommodity: "" } });
+        return res.json({ ok: true, reply: `Using ${proposal.laneName}. Shift ${proposal.input.items.length} items by ${proposal.input.deltaDays} days? Review and confirm.`, intent: { type: "none", targetCarline: "", targetCommodity: "" }, writeProposal: proposal });
+      }
+      let candidates;
+      if (targetPlanScope) {
+        const context = createPlanResolverContext(targetPlanScope, { visibleLanes });
+        const resolved = resolveItemForEdit(rawTarget, context, { selectedLane: agentContext.selectedLane, selectedItemId: agentContext.selectedItemId, finalLaneId: getMyPlanSlot(targetPlanScope.finalPlanSource)?.laneId });
+        candidates = resolved.status === "resolved"
+          ? findEditCandidates([targetPlanScope], resolved.candidate.name, visibleLanes).filter((candidate) => candidate.itemId === resolved.candidate.id)
+          : resolved.status === "ambiguous"
+            ? findEditCandidates([targetPlanScope], rawTarget, visibleLanes).filter((candidate) => resolved.candidates.some((item) => item.name === candidate.itemName && item.lane === candidate.laneName))
+          : resolved.explicitLane ? [] : findEditCandidates([targetPlanScope], rawTarget, visibleLanes);
+        if (!candidates.length) return res.json({ ok: true, reply: `I could not find "${rawTarget}" in ${publicPlanName(targetPlanScope)}. Check the milestone or lane name; other plans were not changed.`, intent: { type: "none", targetCarline: "", targetCommodity: "" } });
+      } else {
+        candidates = findEditCandidates(scopedPlans, rawTarget, visibleLanes);
+      }
       if (candidates.length > 1) {
         const pending = pendingActionResponse({ originalMessage: latestUserText, edit: directEdit, candidates });
         const question = pending.currentClarificationField === "carline"
@@ -3032,10 +3134,11 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
 
     let raw;
     let writeProposal = null;
+    const writeProposals = [];
     try {
       const tools = [...createReadOnlyToolDefinitions(), ...createActionToolDefinitions()];
       for (let attempt = 0; attempt < 3; attempt += 1) {
-        const message = await requestModel(contextMessages, { tools, toolChoice: "auto", returnMessage: true });
+        const message = await requestModel(contextMessages, { tools, toolChoice: "auto", returnMessage: true, reasoningEffort: CHAT_REASONING_EFFORT, label: `chat round ${attempt + 1}` });
         if (!Array.isArray(message.tool_calls) || !message.tool_calls.length) {
           raw = message.content || "";
           break;
@@ -3047,16 +3150,29 @@ app.post("/ai-chat", requireCurrentUser, async (req, res) => {
           try { args = JSON.parse(call.function?.arguments || "{}"); } catch { args = {}; }
           let result;
           if (tool === "createPlanLane" || tool === "createSubActivityLane" || tool === "createSubActivity" || tool === "createMilestone" || tool === "updateItem" || tool === "shiftItems" || tool === "deleteItem" || tool === "markComplete") {
-            const proposal = selectedStoredPlan ? await createProposal(tool, args, selectedStoredPlan, { visibleLanes }) : null;
+            const pendingItems = writeProposals.filter((entry) => entry.input?.startDate && entry.input?.name).map((entry, index) => ({ id: `pending:${index}`, name: entry.input.name, laneId: entry.input.lane, kind: "readOnlyItem", startDate: entry.input.startDate, endDate: entry.input.endDate || entry.input.startDate }));
+            const proposal = selectedStoredPlan ? await createProposal(tool, args, selectedStoredPlan, { visibleLanes, pendingItems, selectedLane: agentContext.selectedLane, selectedItemId: agentContext.selectedItemId }) : null;
             if (!proposal) result = { ok: false, status: "not_found", message: "Select a plan before creating an item." };
             else if (proposal.error) result = proposal.error;
             else {
-              writeProposal = proposal;
+              writeProposals.push(proposal);
               result = { ok: true, requiresConfirmation: true, proposal };
             }
           } else result = await executeReadTool({ owner: req.currentUser, tool, args, plans: scopedPlans, timeZone });
           if (result.ok === false && !["ambiguous", "not_found", "rejected"].includes(result.status)) await auditReadToolCall(req.currentUser, tool || "unknown", args, result);
           contextMessages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+        }
+        if (writeProposals.length) {
+          writeProposal = writeProposals.length === 1 ? writeProposals[0] : {
+            action: "batch",
+            intentType: "BATCH",
+            planRef: writeProposals[0].planRef,
+            input: { proposals: writeProposals },
+            laneName: [...new Set(writeProposals.map((entry) => entry.laneName).filter(Boolean))].join(", "),
+            preview: { kind: "batch" }
+          };
+          raw = JSON.stringify({ reply: writeProposals.length === 1 ? describeWriteProposal(writeProposal) : `Ready to apply ${writeProposals.length} changes:\n${writeProposals.map((entry) => `- ${describeWriteProposal(entry).replace(/ (?:Confirm to apply\.|\? Confirm to apply\.)$/, "")}`).join("\n")}\nConfirm to apply all.`, intent: { type: "none", targetCarline: "", targetCommodity: "" } });
+          break;
         }
       }
       raw ||= "I could not complete a grounded read-only lookup.";

@@ -30,6 +30,56 @@ after(async () => {
   await server?.stop();
 });
 
+test("remembered login survives backend restart and logout remains revoked after another restart", async () => {
+  const instance = await startTestServer({ users: [mockUser("persist"), mockUser("otherme")] });
+  try {
+    const login = await instance.call("/api/auth/login", {
+      method: "POST", body: { identifier: "persist", password: "Strong#1234", rememberMe: true }
+    });
+    assert.equal(login.status, 200);
+    assert.match(login.setCookie.join(";"), /Expires=/i);
+    assert.match(login.setCookie.join(";"), /HttpOnly/i);
+    const cookie = login.setCookie.map((value) => value.split(";")[0]).join("; ");
+    const otherLogin = await instance.call("/api/auth/login", {
+      method: "POST", body: { identifier: "otherme", password: "Strong#1234", rememberMe: true }
+    });
+    assert.equal(otherLogin.status, 200);
+    const otherCookie = otherLogin.setCookie.map((value) => value.split(";")[0]).join("; ");
+    await instance.restart();
+    const restored = await instance.call("/api/auth/me", { cookie });
+    assert.equal(restored.status, 200);
+    assert.equal(restored.json.user, "persist");
+    assertNoCredentials(restored.json);
+    assert.equal((await instance.call("/api/auth/me", { cookie: otherCookie })).json.user, "otherme");
+    const concurrent = await Promise.all(Array.from({ length: 20 }, () => instance.call("/api/auth/me", { cookie })));
+    assert.ok(concurrent.every((response) => response.status === 200));
+    assert.equal((await instance.call("/api/auth/logout", { method: "POST", cookie })).status, 200);
+    assert.doesNotMatch(instance.output.join(""), /Request failed:|ERR_HTTP_HEADERS_SENT/);
+    await instance.restart();
+    assert.equal((await instance.call("/api/auth/me", { cookie })).status, 401);
+    assert.equal((await instance.call("/api/auth/me", { cookie: otherCookie })).json.user, "otherme");
+  } finally {
+    await instance.stop();
+  }
+});
+
+test("remember-me persists cookies only when selected and logout clears them", async () => {
+  for (const rememberMe of [false, true]) {
+    const login = await server.call("/api/auth/login", {
+      method: "POST", body: { identifier: "owneraa", password: "Strong#1234", rememberMe }
+    });
+    assert.equal(login.status, 200);
+    assert.equal(/Expires=/i.test(login.setCookie.join(";")), rememberMe);
+    assert.match(login.setCookie.join(";"), /HttpOnly/i);
+    assert.match(login.setCookie.join(";"), /SameSite=Lax/i);
+    const cookie = login.setCookie.map((value) => value.split(";")[0]).join("; ");
+    const logout = await server.call("/api/auth/logout", { method: "POST", cookie });
+    assert.equal(logout.status, 200);
+    assert.match(logout.setCookie.join(";"), /Expires=Thu, 01 Jan 1970/i);
+    assert.equal((await server.call("/api/auth/me", { cookie })).status, 401);
+  }
+});
+
 test("register creates pending user and blocks login before approval", async () => {
   const register = await server.call("/api/auth/register", {
     method: "POST",
@@ -215,6 +265,49 @@ test("chat open-plan requests resolve carline and commodity to the exact plan", 
   const ambiguous = await chat("open x192");
   assert.equal(ambiguous.json.intent.type, "none");
   assert.match(ambiguous.json.reply, /Which one should I open/);
+});
+
+test("chat edits stay in the selected plan and prefer explicit, selected, then finalized editable lanes", async () => {
+  const cookie = await server.login("owneraa");
+  const milestone = { key: "ppap", name: "PPAP", plannedDate: "2027-01-01", overrideDate: "", endDate: "2027-01-01", isDuration: false };
+  const localPlan = { id: "chat-focused", planId: "chat-focused", owner: "owneraa", carline: "X591", commodity: "Brake Hose", builds: [], milestones: { ppap: milestone }, customPlan: { active: true, milestones: { ppap: milestone } }, customPlan2: { active: true, milestones: { ppap: milestone } }, subActivities: [], finalPlanSource: "myPlan2" };
+  assert.equal((await server.call("/api/plans/save", { method: "POST", cookie, body: localPlan })).status, 200);
+  assert.equal((await server.call("/api/plans/save", { method: "POST", cookie, body: { ...localPlan, id: "chat-other", planId: "chat-other", carline: "X700", customPlan: { active: true, milestones: { ppap: milestone, elsewhere: { ...milestone, key: "elsewhere", name: "Only Elsewhere" } } } } })).status, 200);
+  const ask = (content, agentContext = {}) => server.call("/ai-chat", { method: "POST", cookie, body: { selectedPlanRef: "chat-focused", agentContext, messages: [{ role: "user", content }] } });
+  const final = await ask("move PPAP by 2 days");
+  assert.equal(final.status, 200);
+  assert.equal(final.json.writeProposal.planRef, "chat-focused");
+  assert.equal(final.json.writeProposal.input.items[0].customPlanField, "customPlan2");
+  assert.equal(final.json.pendingAgentAction.status, "ready_for_confirmation");
+  const selected = await ask("move PPAP by 2 days", { selectedLane: "my-plan" });
+  assert.equal(selected.json.writeProposal.input.items[0].customPlanField, "customPlan");
+  const explicit = await ask("move PPAP in My Plan 2 by 2 days", { selectedLane: "my-plan" });
+  assert.equal(explicit.json.writeProposal.input.items[0].customPlanField, "customPlan2");
+  const duration = await ask("set PPAP duration to 180 days");
+  assert.equal(duration.json.writeProposal.input.item.customPlanField, "customPlan2");
+  assert.equal(duration.json.writeProposal.input.startDate, "2027-01-01");
+  assert.equal(duration.json.writeProposal.input.endDate, "2027-06-29");
+  const missing = await ask("move Only Elsewhere by 2 days");
+  assert.equal(missing.status, 200);
+  assert.equal(missing.json.writeProposal, undefined);
+  assert.match(missing.json.reply, /could not find.*Only Elsewhere.*X591/i);
+  const invalidLane = await ask("move PPAP in My Plan 5 by 2 days");
+  assert.equal(invalidLane.json.writeProposal, undefined);
+  assert.match(invalidLane.json.reply, /could not find/i);
+  const bulk = await ask("move all milestones in My Plan 2 by 2 days");
+  assert.equal(bulk.json.writeProposal.input.items.length, 1);
+  assert.equal(bulk.json.writeProposal.input.items[0].customPlanField, "customPlan2");
+  const duplicate = { ...localPlan, customPlan2: { active: true, milestones: { ppap: milestone, another: { ...milestone, key: "another" } } } };
+  assert.equal((await server.call("/api/plans/save", { method: "POST", cookie, body: duplicate })).status, 200);
+  const ambiguous = await ask("move PPAP by 2 days");
+  assert.equal(ambiguous.json.pendingAgentAction.status, "needs_clarification");
+  assert.equal(ambiguous.json.pendingAgentAction.candidateItems.length, 2);
+  assert.ok(ambiguous.json.pendingAgentAction.candidateItems.every((item) => item.laneId === "my-plan-2"));
+  const clarified = await server.call("/ai-chat", { method: "POST", cookie, body: { selectedPlanRef: "chat-focused", pendingAgentAction: ambiguous.json.pendingAgentAction, messages: [{ role: "user", content: "option 2" }] } });
+  assert.equal(clarified.json.writeProposal.input.items[0].milestoneKey, "another");
+  const superseded = await server.call("/ai-chat", { method: "POST", cookie, body: { selectedPlanRef: "chat-focused", pendingAgentAction: ambiguous.json.pendingAgentAction, messages: [{ role: "user", content: "move PPAP in My Plan by 3 days" }] } });
+  assert.equal(superseded.json.writeProposal.input.items[0].customPlanField, "customPlan");
+  assert.equal((await server.call("/api/plans/chat-focused", { cookie })).json.plan.customPlan2.milestones.ppap.plannedDate, "2027-01-01");
 });
 
 test("what-if shift questions stay on the open plan and report build impact", async () => {
