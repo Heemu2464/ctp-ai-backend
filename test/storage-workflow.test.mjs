@@ -262,7 +262,7 @@ try {
   response = await fetch(`${api}/api/plans/save`, {
     method: "POST",
     headers: headers(ALICE),
-    body: JSON.stringify(plan(ALICE, "bob-x591-hitch"))
+    body: JSON.stringify(plan(BOB, "bob-x591-hitch"))
   });
   const forbiddenSave = await response.json();
   assert.equal(response.status, 403);
@@ -292,6 +292,32 @@ try {
   response = await fetch(`${api}/api/plans/bob-x591-hitch`, { headers: auth(BOB) });
   assert.equal((await response.json()).plan.owner, BOB);
   assert.equal((await readdir(path.join(root, "shared_templates"))).length, 0);
+
+  const bobPlanPath = path.join(root, "users", BOB, "bob-x591-hitch.json");
+  const bobPlanBeforeSave = await readFile(bobPlanPath, "utf8");
+  response = await fetch(`${api}/api/plans/save`, {
+    method: "POST",
+    headers: headers(ALICE),
+    body: JSON.stringify(plan(ALICE, "bob-x591-hitch", "X192", "Independent Hitch"))
+  });
+  const independentPlan = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(independentPlan.plan.owner, ALICE);
+  assert.equal(independentPlan.plan.ownerUserId, mockUser(ALICE).id);
+  assert.equal(await readFile(bobPlanPath, "utf8"), bobPlanBeforeSave);
+  const independentPlanPath = path.join(root, "users", ALICE, "bob-x591-hitch.json");
+  assert.equal(JSON.parse(await readFile(independentPlanPath, "utf8")).commodity, "Independent Hitch");
+
+  const protectedPlanPath = path.join(root, "users", ALICE, "protected-plan.json");
+  const protectedPlan = JSON.stringify({ ...plan(ALICE, "protected-plan"), ownerUserId: mockUser(BOB).id });
+  await writeFile(protectedPlanPath, protectedPlan, "utf8");
+  response = await fetch(`${api}/api/plans/save`, {
+    method: "POST",
+    headers: headers(ALICE),
+    body: JSON.stringify(plan(ALICE, "protected-plan"))
+  });
+  assert.equal(response.status, 403);
+  assert.equal(await readFile(protectedPlanPath, "utf8"), protectedPlan);
 
   response = await fetch(`${api}/api/plans/alice-x192-brake-hose`, {
     method: "DELETE",

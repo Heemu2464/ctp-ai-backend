@@ -67,9 +67,37 @@ Plan ownership is enforced by internal `ownerUserId` (not by client-provided own
 
 Shared Plans (`GET /api/plans/shared`) lists every other user's plan as read-only, without internal owner IDs or file paths. Any signed-in user can copy one with `POST /api/plans/copy`, which creates their own baseline copy. Only the owner can save, edit or delete a plan.
 
+Saving checks only the destination file in the authenticated user's folder; it does not scan shared plans or other users' folders. Different users can save the same plan ID independently. Client-supplied foreign owners and changes to a destination file owned by a different internal user ID are rejected.
+
 The server refuses to start if `SESSION_SECRET` is shorter than 32 characters.
 
 **Without HTTPS, session cookies and plan data travel unencrypted on the network.** Set `COOKIE_SECURE=true` once the app is served over HTTPS.
+
+## Email event reminders
+
+Home > Email Reminders lets each signed-in user enable reminders and choose 0-365 calendar days before an event. Preferences default to off with a 3-day lead time. The recipient always comes from the registered account, not the browser request. `GET` and `PUT /api/reminders/settings` require authentication and access only that account's preferences.
+
+Configure these variables in the backend environment, then restart the backend:
+
+```dotenv
+SMTP_HOST=your-approved-smtp-server
+SMTP_PORT=587
+SMTP_SECURE=false
+SMTP_REQUIRE_TLS=true
+MAIL_FROM=
+SMTP_USER=your-smtp-account
+SMTP_PASS=your-smtp-secret
+```
+
+Leave `MAIL_FROM` empty to use the registered email of an approved admin account as the sender. Accounts requiring a password reset are excluded; if there are multiple eligible admins, the first by Short ID is used. Set `MAIL_FROM` explicitly to override that default. The SMTP service must authorize the selected sender (including any send-as permissions); the planner account password is never used for SMTP authentication.
+
+For implicit TLS on port 465 use `SMTP_SECURE=true`. Omit both credentials only for an IT-approved relay that does not require authentication. Do not commit credentials. TLS is required by default for non-implicit-TLS connections; disable it only for an explicitly approved relay or isolated local tests. No production SMTP settings are supplied automatically. The UI distinguishes missing server configuration from saved preferences; configuration presence is not proof of inbox delivery.
+
+While the backend is running, the scheduler checks at startup and every 15 minutes, even with no browser session. It considers event start dates in the user's own builds, finalized plan milestones (including all five My Plans), and sub-activities, excluding shared plans and walkthrough demos. Date comparisons use UTC calendar days. Due events are grouped into an email and sent once within the selected lead-time window. Newly enabled reminders and downtime recoveries can send events already inside that window; past events are not sent. Restarting a stopped backend is required for delivery to resume.
+
+Preferences and the sent-event ledger live under `(BTV_AUTH_STORAGE_ROOT || BTV_STORAGE_ROOT)/auth/reminders`, keyed by internal account ID and outside frontend static assets. Failed SMTP submissions remain retryable. After SMTP acceptance, the ledger prevents repeat notifications across normal checks and restarts. A crash or storage failure between SMTP acceptance and recording the send can cause a duplicate; SMTP cannot guarantee exactly-once delivery. This scheduler supports one backend instance, like the existing JSON account/session storage.
+
+`node --test test/reminders.test.mjs` verifies preference isolation, authentication, lead times, ownership/finalized lanes, persistence, deduplication, retries, opt-out during scans, and actual SMTP hand-off to a local test server without sending external email.
 
 ## Production hosting
 

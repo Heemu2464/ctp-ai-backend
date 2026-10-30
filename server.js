@@ -20,6 +20,8 @@ import { analyzeBuildImpact, describeBuildImpact, findPlanItemMention } from "..
 import { createLocalAuthRouter } from "./auth/localRoutes.js";
 import { createUserRepository, LOCAL_IDENTITY_SOURCE, normalizeShortId } from "./auth/localAuth.js";
 import { createRequireAuth, requireAdmin } from "./auth/localMiddleware.js";
+import nodemailer from "nodemailer";
+import { createReminderRunner, createReminderStore, resolveReminderSender, validateReminderSettings } from "./reminderService.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -808,6 +810,38 @@ async function writePlan(plan, currentUser, currentUserId) {
 
 const usersRepository = createUserRepository({ storageRoot: AUTH_STORAGE_ROOT });
 const requireCurrentUser = createRequireAuth(usersRepository);
+const reminderStore = createReminderStore(AUTH_STORAGE_ROOT);
+const smtpPort = Number(process.env.SMTP_PORT || 587);
+const smtpSecure = String(process.env.SMTP_SECURE || "false") === "true";
+const reminderTransport = process.env.SMTP_HOST && Number.isInteger(smtpPort) && smtpPort > 0 && smtpPort <= 65535
+  && (!process.env.SMTP_USER || process.env.SMTP_PASS)
+  ? nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: smtpPort,
+    secure: smtpSecure,
+    requireTLS: !smtpSecure && String(process.env.SMTP_REQUIRE_TLS || "true") !== "false",
+    auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 30000,
+    disableFileAccess: true,
+    disableUrlAccess: true
+  }) : null;
+async function getReminderSender() {
+  return resolveReminderSender(await usersRepository.listPublicUsers(), process.env.MAIL_FROM || "");
+}
+const checkEmailReminders = createReminderRunner({
+  store: reminderStore,
+  listUsers: () => usersRepository.listPublicUsers(),
+  getPlans: (user) => getAllPlansForUser(user.shortId, user.id),
+  sendMail: async (message) => {
+    const from = await getReminderSender();
+    if (!from) throw new Error("An approved admin email or explicit sender is required.");
+    const result = await reminderTransport.sendMail({ ...message, from });
+    if (!result.accepted?.length) throw new Error("Reminder email was not accepted.");
+  },
+  onError: (error) => console.error("Email reminder check failed:", error.code || "REMINDER_ERROR")
+});
 let credentialMigrationPromise;
 
 app.use(async (req, res, next) => {
@@ -824,6 +858,26 @@ app.use(async (req, res, next) => {
 });
 
 app.use("/api/auth", createLocalAuthRouter({ users: usersRepository, cookieName: SESSION_COOKIE_NAME, storageRoot: STORAGE_ROOT }));
+
+app.get("/api/reminders/settings", requireCurrentUser, async (req, res) => {
+  try {
+    const state = await reminderStore.read(req.currentUserId);
+    res.json({ ok: true, settings: state.settings, email: req.authUser.email, deliveryConfigured: Boolean(reminderTransport && await getReminderSender()) });
+  } catch {
+    res.status(500).json({ ok: false, error: "Could not load email reminder settings." });
+  }
+});
+
+app.put("/api/reminders/settings", requireCurrentUser, async (req, res) => {
+  const checked = validateReminderSettings(req.body);
+  if (!checked.value) return res.status(400).json({ ok: false, error: checked.error });
+  try {
+    const state = await reminderStore.saveSettings(req.currentUserId, checked.value);
+    return res.json({ ok: true, settings: state.settings, email: req.authUser.email, deliveryConfigured: Boolean(reminderTransport && await getReminderSender()) });
+  } catch {
+    return res.status(500).json({ ok: false, error: "Could not save email reminder settings." });
+  }
+});
 
 app.get("/api/session", requireCurrentUser, (_req, res) => {
   const user = _req.authUser;
@@ -1194,9 +1248,12 @@ app.post("/api/plans/save", async (req, res) => {
     if (plan.owner && normalizeUserName(plan.owner) !== owner) {
       return res.status(403).json(readOnlyError());
     }
-    // A plan ID identifies its owner across the workspace. Do not let another user create a
-    // same-ID copy through the save endpoint; they must use the explicit copy endpoint instead.
-    const existingPlan = await findPlanByIdOrFileId(plan.planId);
+    let existingPlan = null;
+    try {
+      existingPlan = JSON.parse(await fs.readFile(buildPlanPath(owner, plan), "utf8"));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
     if (existingPlan && !userOwnsPlan(existingPlan, { id: req.currentUserId, shortId: req.currentUser })) {
       return res.status(403).json(readOnlyError());
     }
@@ -3265,4 +3322,8 @@ app.listen(PORT, () => {
   console.log(`[LLM] Provider: ${LLM_PROVIDER}, Model: ${LLM_MODEL}`);
   const hasKey = LLM_PROVIDER === "openai" ? !!process.env.OPENAI_API_KEY : !!process.env.MB_GENAI_API_KEY;
   console.log(`[LLM] API key configured: ${hasKey ? "yes" : "NO — extraction will fail!"}`);
+  if (reminderTransport) {
+    void checkEmailReminders();
+    setInterval(() => { void checkEmailReminders(); }, 15 * 60 * 1000).unref();
+  }
 });
