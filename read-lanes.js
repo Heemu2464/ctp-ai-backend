@@ -111,3 +111,78 @@ export function queryOpenAndOverduePlanItems(planEntries, filter = {}, today) {
   }, {}));
   return { groups, total, page, pageSize, hasMore: page * pageSize < total, truncated: page * pageSize < total };
 }
+
+const ALL_ROWS_PATTERN = /^(?:|all|any|every|everything|\*|all rows|all lanes|whole plan|entire plan|complete|mom|journal|all mom|all journals?)$/i;
+
+export function isAllJournalRows(rowQuery) {
+  return ALL_ROWS_PATTERN.test(String(rowQuery || "").trim());
+}
+
+const compactName = (value) => String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+
+// A bare carline ("X591") covers every commodity plan of that carline.
+export function plansForCarline(query, plans) {
+  const compactQuery = compactName(query);
+  if (compactQuery.length < 3) return [];
+  return plans.filter((plan) => {
+    const carline = compactName(plan.carline);
+    return carline.length >= 3 && (compactQuery === carline || compactQuery.includes(carline));
+  });
+}
+
+export function journalRowName(plan, rowId) {
+  const fixed = { "build-plan": "Build Plan", "rule-plan": "BTV Rule Plan", "ai-optimized": "AI Optimized", "supplier-imports": "Supplier Imported Milestones", "my-plan": "My Plan" };
+  if (fixed[rowId]) return fixed[rowId];
+  const myPlan = /^my-plan-(\d+)$/.exec(rowId);
+  if (myPlan) return `My Plan ${myPlan[1]}`;
+  if (rowId.startsWith("sub-activity-")) {
+    const activity = (plan.subActivities || []).find((candidate) => `sub-activity-${candidate.id}`.replace(/[^a-zA-Z0-9._-]+/g, "_") === rowId || `sub-activity-${candidate.id}` === rowId);
+    if (activity) return String(activity.name || "Sub-Activity").replace(/\s+/g, " ").trim();
+  }
+  if (rowId.startsWith("actual-")) {
+    const execution = [...(plan.actualExecutionHistory || []), plan.actualExecution].find((candidate) => candidate && `actual-${candidate.id}` === rowId);
+    return execution?.name || "Actual Execution";
+  }
+  return rowId;
+}
+
+const SEARCH_STOP_WORDS = new Set(["the", "and", "for", "with", "what", "which", "when", "where", "who", "how", "should", "would", "could", "about", "from", "this", "that", "there", "have", "has", "are", "was", "were", "topic", "row", "lane", "plan", "mom", "journal", "entry", "entries", "email", "mail", "der", "die", "das", "und", "mit", "für", "von"]);
+
+// Word stems (first 5 letters) so "stakeholders alignment" also hits "stakeholder" and "align on".
+function searchStems(search) {
+  return [...new Set(String(search || "").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word.length >= 3 && !SEARCH_STOP_WORDS.has(word)).map((word) => word.slice(0, 5)))];
+}
+
+// Keywords only rank entries (best match first, then newest); nothing is dropped, because exact wording rarely matches the question.
+export function selectJournalEntries(entries, { search = "", fromDate = "", toDate = "", limit = 40, maxChars = 120000, maxEntryChars = 40000 } = {}) {
+  const stems = searchStems(search);
+  const inRange = entries.filter((entry) => (!fromDate || String(entry.entryDate || "") >= fromDate) && (!toDate || String(entry.entryDate || "") <= toDate));
+  const scored = inRange.map((entry) => {
+    const haystack = `${entry.text || ""} ${entry.lane || ""}`.toLowerCase();
+    return { entry, score: stems.filter((stem) => haystack.includes(stem)).length };
+  });
+  const matching = scored
+    .sort((left, right) => right.score - left.score || String(right.entry.entryDate || "").localeCompare(String(left.entry.entryDate || "")) || String(right.entry.createdAt || "").localeCompare(String(left.entry.createdAt || "")))
+    .map((item) => item.entry);
+  const matchedCount = scored.filter((item) => item.score > 0).length;
+  const selected = [];
+  let used = 0;
+  let shortened = false;
+  for (const entry of matching.slice(0, Math.max(1, Math.min(Number(limit) || 40, 100)))) {
+    const room = Math.min(maxEntryChars, maxChars - used);
+    if (room < 200) break;
+    const text = String(entry.text || "");
+    const clipped = text.length > room ? `${text.slice(0, room)} [entry shortened]` : text;
+    shortened ||= clipped !== text;
+    used += clipped.length;
+    selected.push({ plan: entry.plan, lane: entry.lane, entryDate: entry.entryDate, text: clipped, attachments: entry.attachments || [] });
+  }
+  return {
+    entries: selected,
+    total: matching.length,
+    returned: selected.length,
+    keywordMatches: stems.length ? matchedCount : undefined,
+    truncated: shortened || selected.length < matching.length,
+    guidance: "Entries are ranked by keyword overlap, not filtered. Read every returned entry and answer from its meaning, even when the user's wording differs from the text."
+  };
+}

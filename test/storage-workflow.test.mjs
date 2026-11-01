@@ -161,6 +161,14 @@ try {
   assert.equal(isolatedJournal.total, 1);
   assert.equal(isolatedJournal.items[0].text, "Rule row only.");
 
+  response = await fetch(`${api}/api/plans/alice-x192-brake-hose/journal-previews`, { headers: auth(ALICE) });
+  const previews = (await response.json()).previews;
+  assert.equal(response.status, 200);
+  assert.deepEqual(Object.keys(previews).sort(), ["build-plan", "rule-plan"]);
+  assert.equal(previews["build-plan"].total, 2);
+  assert.equal(previews["build-plan"].items.length, 2);
+  assert.equal(previews["rule-plan"].items[0].text, "Rule row only.");
+
   response = await fetch(`${journalBase}/build-plan/journal/${firstJournalCreate.entry.id}`, {
     method: "PUT",
     headers: headers(ALICE),

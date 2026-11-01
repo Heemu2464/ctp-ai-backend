@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildReadLanes, queryOpenAndOverduePlanItems, queryReadItems } from "../read-lanes.js";
+import { buildReadLanes, isAllJournalRows, journalRowName, plansForCarline, queryOpenAndOverduePlanItems, queryReadItems, selectJournalEntries } from "../read-lanes.js";
 
 const plan = {
   builds: [{ name: "E-Build", start: "2026-10-01", end: "2026-10-03" }],
@@ -105,4 +105,46 @@ test("groups open and overdue items across plans and pages the result", () => {
   assert.equal(result.truncated, true);
   assert.ok(result.groups.every((group) => group.plan));
   assert.equal(result.groups.flatMap((group) => group.items).some((item) => item.name === "My Plan item"), false);
+});
+
+test("treats a missing or generic row as all MOM rows and a bare carline as all of its plans", () => {
+  for (const value of ["", "all", "All rows", "MOM", "everything", undefined]) assert.equal(isAllJournalRows(value), true);
+  assert.equal(isAllJournalRows("Build Plan"), false);
+  const plans = [{ carline: "X591", commodity: "Brakehose" }, { carline: "X591", commodity: "Tape" }, { carline: "X192", commodity: "Brake Hose" }];
+  assert.deepEqual(plansForCarline("x591", plans).map((entry) => entry.commodity), ["Brakehose", "Tape"]);
+  assert.deepEqual(plansForCarline("X591 - Brakehose", plans).map((entry) => entry.commodity), ["Brakehose", "Tape"]);
+  assert.deepEqual(plansForCarline("X5", plans), []);
+  assert.equal(journalRowName(plan, "sub-activity-stone-chipping"), "Stone Chipping");
+  assert.equal(journalRowName(plan, "my-plan-3"), "My Plan 3");
+  assert.equal(journalRowName(plan, "build-plan"), "Build Plan");
+});
+
+test("selects MOM entries newest first, matches every search word, and stays within the context budget", () => {
+  const entries = [
+    { plan: "X591 - Brakehose", lane: "Build Plan", entryDate: "2026-10-01", text: "Supplier confirmed tooling start." },
+    { plan: "X591 - Brakehose", lane: "Long Term Solution", entryDate: "2026-10-20", text: "Email: Corrosion test\nFrom: Anna\n\nCorrosion test passed for heat shrink tube." },
+    { plan: "X591 - Tape", lane: "Tape Application", entryDate: "2026-10-10", text: "x".repeat(50000) }
+  ];
+  const all = selectJournalEntries(entries);
+  assert.deepEqual(all.entries.map((entry) => entry.entryDate), ["2026-10-20", "2026-10-10", "2026-10-01"]);
+  assert.equal(all.truncated, true);
+  assert.ok(all.entries[1].text.endsWith("[entry shortened]"));
+  assert.ok(all.entries[1].text.length < 40100);
+
+  const searched = selectJournalEntries(entries, { search: "corrosion heat" });
+  assert.deepEqual(searched.entries.map((entry) => entry.lane), ["Long Term Solution", "Tape Application", "Build Plan"]);
+  assert.equal(searched.keywordMatches, 1);
+  assert.equal(selectJournalEntries(entries, { search: "tape application" }).entries[0].lane, "Tape Application");
+  assert.equal(selectJournalEntries(entries, { fromDate: "2026-10-05", toDate: "2026-10-15" }).total, 1);
+
+  const aligned = selectJournalEntries([
+    { lane: "Stone Chipping", entryDate: "2026-10-31", text: "We therefore need to align on the following: vehicles already built, Tesa tape, heat-shrink tubing." },
+    { lane: "Stone Chipping", entryDate: "2026-10-30", text: "Supplier visit planned." }
+  ], { search: "what should be aligned with stakeholders" });
+  assert.equal(aligned.entries[0].entryDate, "2026-10-31");
+  assert.equal(aligned.returned, 2);
+
+  const budgeted = selectJournalEntries(Array.from({ length: 30 }, (_, index) => ({ lane: "Row", entryDate: `2026-09-${String(index + 1).padStart(2, "0")}`, text: "y".repeat(5000) })), { maxChars: 20000 });
+  assert.ok(budgeted.entries.reduce((sum, entry) => sum + entry.text.length, 0) <= 20000 + 40);
+  assert.equal(budgeted.truncated, true);
 });

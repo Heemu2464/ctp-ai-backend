@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { generateRecoveryScenarios } from "../../../timing-planner/src/recoveryService.js";
+import { MY_PLAN_SLOTS } from "../../../timing-planner/src/myPlans.js";
 import { mockUser, startTestServer } from "./helpers/testServer.mjs";
 
 const USER = "rectest";
@@ -60,20 +61,28 @@ try {
   assert.equal(alternative.structuredResponse.intent, "SHOW_ANOTHER_RECOVERY_OPTION");
   assert.equal(alternative.recoveryAction.type, "select-option");
 
-  const target = await chat("Use My Plan 2", activeSession);
-  assert.equal(target.recoveryAction.type, "set-target-lane");
-  assert.equal(target.recoveryAction.targetLaneId, "my-plan-2");
+  for (const slot of MY_PLAN_SLOTS) {
+    const target = await chat(`Use ${slot.label}`, activeSession);
+    assert.equal(target.recoveryAction.type, "set-target-lane");
+    assert.equal(target.recoveryAction.targetLaneId, slot.laneId);
+  }
 
   const apply = await chat("Apply it", activeSession);
   assert.equal(apply.structuredResponse.type, "recovery_confirmation");
   assert.equal(apply.recoveryAction.operation, "apply");
   assert.equal(apply.recoveryAction.targetLaneId, "my-plan");
 
-  const copySession = { ...activeSession, targetLaneId: "my-plan-2" };
-  const copy = await chat("Copy it to My Plan 2", copySession);
-  assert.equal(copy.structuredResponse.type, "recovery_confirmation");
-  assert.equal(copy.recoveryAction.operation, "copy");
-  assert.equal(copy.recoveryAction.targetLaneId, "my-plan-2");
+  for (const slot of MY_PLAN_SLOTS) {
+    const copy = await chat(`Copy it to ${slot.label}`, { ...activeSession, targetLaneId: slot.laneId });
+    assert.equal(copy.structuredResponse.type, "recovery_confirmation");
+    assert.equal(copy.recoveryAction.operation, "copy");
+    assert.equal(copy.recoveryAction.targetLaneId, slot.laneId);
+    assert.ok(copy.reply.includes(`to ${slot.label}?`));
+  }
+
+  const invalidTarget = await chat("Copy it to My Plan 6", activeSession);
+  assert.equal(invalidTarget.recoveryAction.type, "invalid-target");
+  assert.match(invalidTarget.reply, /choose My Plan, My Plan 2, My Plan 3, My Plan 4, My Plan 5/i);
 
   const cancel = await chat("Cancel recovery", activeSession);
   assert.equal(cancel.recoveryAction.type, "cancel");
